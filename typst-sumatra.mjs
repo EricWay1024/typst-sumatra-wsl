@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
+import { openInEditor, editorSocket } from './editor-ipc.mjs';
 
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -169,7 +170,7 @@ async function watch(config) {
   let ready = fs.existsSync(pdf) && fs.statSync(pdf).size > 0, points = [], lastResolved = null;
   let mappingReady = false, snapshot = null, activeSnapshot = null, mapWorker = null;
   let mapperPromise = null, mapperReady = false, mapperPaused = false, idleTimer, warmupTimer, native;
-  let shuttingDown = false, timings = {}, nativeStarted = 0;
+  let shuttingDown = false, timings = {}, nativeStarted = 0, lastEditor = null;
   let sourceCache = new Map(), pointLookup = new Map(), pageLookup = new Map();
   let queue = Promise.resolve(), pending = null, child;
   let control, dataSocket, controlPort, dataPort, errorLog = '', logBuffer = '';
@@ -183,6 +184,7 @@ async function watch(config) {
     if (request.method === 'GET' && request.url === '/status') return reply(200, {
       ready, mappingReady, input, pdf, lastResolved, timings, mapperRunning: !!child, mapperPaused,
       mapperReady, mapperPid: child?.pid ?? null, revision, cachedPositions: sourceCache.size,
+      editor: { ...editorSocket(), lastRequest: lastEditor },
     });
     if (request.method === 'POST' && request.url === '/shutdown') {
       reply(200, { stopped: true });
@@ -196,7 +198,7 @@ async function watch(config) {
         body += chunk;
         if (body.length > 2048) throw Error('Request too large');
       }
-      const id = JSON.parse(body).id;
+      const { id, open: openEditor } = JSON.parse(body);
       if (!Number.isInteger(id) || id < 1 || id > 2147483647) throw Error('Invalid PDF source position');
       const started = Date.now(), deadline = started + 20000;
       const result = queue.then(async () => {
@@ -220,7 +222,10 @@ async function watch(config) {
       const resolved = await result;
       timings.lastResolveMs = Date.now() - started;
       lastResolved = { ...resolved, record: id, time: new Date().toISOString() };
-      reply(200, resolved);
+      if (openEditor === true) {
+        lastEditor = { ...await openInEditor(resolved), time: new Date().toISOString() };
+        reply(200, { ...resolved, opened: lastEditor.opened });
+      } else reply(200, resolved);
     } catch (error) { reply(500, { error: error.message }); }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -383,7 +388,10 @@ async function watch(config) {
           const line = logBuffer.slice(0, newline); logBuffer = logBuffer.slice(newline + 1);
           controlPort ||= line.match(/Control (?:plane|panel) server listening on: 127\.0\.0\.1:(\d+)/)?.[1];
           dataPort ||= line.match(/Data plane server listening on: 127\.0\.0\.1:(\d+)/)?.[1];
-          if (line.includes('resolved WebviewResolveFrameLoc: None')) pending?.(null);
+          // v0.14.20 logs FrameLoc results as WebviewResolveSpan (despite the
+          // request name). Missing this negative reply wastes the 3 s timeout
+          // and prevents the nearby-text fallback from ever being attempted.
+          if (/resolved WebviewResolve(?:Span|FrameLoc): None/.test(line)) pending?.(null);
           if (line.includes('compilation succeeded')) mapperReady = true;
         }
       });

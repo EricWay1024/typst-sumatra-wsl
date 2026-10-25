@@ -5,12 +5,13 @@ using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
 
-// Sumatra -> one loopback HTTP request -> the installed VS Code CLI.
-// PowerShell and wsl.exe are not on the normal click path.
+// Sumatra -> one loopback HTTP request -> the running VS Code window's IPC.
+// The installed VS Code CLI remains the fallback; no editor extension is needed.
 internal static class OpenInVSCode {
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
 
@@ -23,6 +24,7 @@ internal static class OpenInVSCode {
         public string filepath { get; set; }
         public int line { get; set; }
         public int column { get; set; }
+        public bool opened { get; set; }
     }
 
     private static string Quote(string value) {
@@ -39,6 +41,27 @@ internal static class OpenInVSCode {
         }
         result.Append('\\', slashes * 2);
         return result.Append('"').ToString();
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(uint processId);
+
+    private static void AllowEditorForeground() {
+        // The Sumatra-launched child can pass its foreground permission to Code.
+        // Without the usual Code.exe CLI process, IPC alone may only flash the
+        // taskbar instead of bringing the editor forward. Do not grant ASFW_ANY.
+        try {
+            using (Process current = Process.GetCurrentProcess()) {
+                foreach (Process process in Process.GetProcessesByName("Code")) {
+                    using (process) {
+                        try {
+                            if (process.SessionId == current.SessionId && process.MainWindowHandle != IntPtr.Zero)
+                                AllowSetForegroundWindow((uint)process.Id);
+                        } catch { /* A Code subprocess may exit while being enumerated. */ }
+                    }
+                }
+            }
+        } catch { /* Foreground permission is best effort, as with the normal CLI. */ }
     }
 
     private static void WriteUtf8(Stream stream, string text) {
@@ -72,7 +95,7 @@ internal static class OpenInVSCode {
         }
     }
 
-    private static Position ResolveHttp(Metadata metadata, int record) {
+    private static Position ResolveHttp(Metadata metadata, int record, bool openEditor) {
         if (metadata.port < 1 || metadata.port > 65535 || String.IsNullOrEmpty(metadata.token))
             throw new Exception("Invalid Typst bridge metadata");
         // Never send the local capability token to a host supplied by a file.
@@ -85,7 +108,8 @@ internal static class OpenInVSCode {
         request.Timeout = 22000;
         request.ReadWriteTimeout = 22000;
         request.ServicePoint.Expect100Continue = false;
-        byte[] body = Encoding.UTF8.GetBytes("{\"id\":" + record.ToString(CultureInfo.InvariantCulture) + "}");
+        byte[] body = Encoding.UTF8.GetBytes("{\"id\":" + record.ToString(CultureInfo.InvariantCulture)
+            + (openEditor ? ",\"open\":true}" : "}"));
         request.ContentLength = body.Length;
         using (Stream stream = request.GetRequestStream()) stream.Write(body, 0, body.Length);
         using (WebResponse response = request.GetResponse())
@@ -93,10 +117,10 @@ internal static class OpenInVSCode {
             return Json.Deserialize<Position>(reader.ReadToEnd());
     }
 
-    private static Position Resolve(string metadataFile, string linuxPath, string distro, int record) {
+    private static Position Resolve(string metadataFile, string linuxPath, string distro, int record, bool openEditor) {
         Metadata metadata = Json.Deserialize<Metadata>(File.ReadAllText(metadataFile));
         try {
-            return ResolveHttp(metadata, record);
+            return ResolveHttp(metadata, record, openEditor);
         } catch (WebException error) {
             if (error.Response != null) {
                 using (WebResponse response = error.Response)
@@ -146,9 +170,12 @@ internal static class OpenInVSCode {
                 if (line < 1) throw new Exception("Invalid PDF source record");
                 if (distro == null) throw new Exception("Typst metadata must name a WSL file");
                 string metadataFile = "\\\\wsl.localhost\\" + distro + source.Replace('/', '\\');
-                Position position = Resolve(metadataFile, source, distro, line);
+                bool openEditor = !printCommand && !resolveOnly;
+                if (openEditor) AllowEditorForeground();
+                Position position = Resolve(metadataFile, source, distro, line, openEditor);
                 if (position == null || String.IsNullOrEmpty(position.filepath) || position.line < 1 || position.column < 1)
                     throw new Exception("The Typst bridge returned an invalid source position");
+                if (openEditor && position.opened) return 0;
                 source = position.filepath;
                 line = position.line;
                 column = position.column;
@@ -160,8 +187,9 @@ internal static class OpenInVSCode {
                 return 0;
             }
 
-            string codeRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                @"Programs\Microsoft VS Code");
+            string codeRoot = Environment.GetEnvironmentVariable("TYPST_SUMATRA_CODE_ROOT");
+            if (String.IsNullOrEmpty(codeRoot)) codeRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\Microsoft VS Code");
             string code = Path.Combine(codeRoot, "Code.exe");
             string launcher = Path.Combine(codeRoot, @"bin\code.cmd");
             // Follow code.cmd: recent VS Code releases use a versioned resources directory.

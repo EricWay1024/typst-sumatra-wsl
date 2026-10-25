@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: node --check typst-sumatra.mjs && node --check integration-test.mjs
-      - run: node --test test.mjs
+      - run: node --test test.mjs editor-ipc.test.mjs
       - run: bash -n install.sh bin/typst-sumatra windows/build.sh
       - name: Check Python syntax without writing bytecode
         run: python3 -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('.').glob('*.py')]"

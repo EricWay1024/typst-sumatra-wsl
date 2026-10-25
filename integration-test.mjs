@@ -2,9 +2,10 @@
 // fixture in persistent project scratch. Never opens VS Code or the user's PDF.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const scratch = process.env.TYPST_SUMATRA_SCRATCH;
 if (!scratch) throw Error('Set TYPST_SUMATRA_SCRATCH to persistent project scratch');
@@ -13,9 +14,22 @@ fs.mkdirSync(path.join(work, 'scratch')); // Also discoverable from a fresh WSL 
 const input = path.join(work, 'test.typ'), pdf = path.join(work, 'test.pdf');
 const metadataFile = path.join(work, '.test.typst-sync.json');
 fs.writeFileSync(input, 'Alpha beta gamma.\n');
+const ipcScratch = fileURLToPath(new URL('./scratch/', import.meta.url));
+fs.mkdirSync(ipcScratch, { recursive: true });
+const editorSocket = path.join(ipcScratch, `integration-${process.pid}.sock`);
+const editorRequests = [];
+const editor = http.createServer(async (request, response) => {
+  let body = '';
+  for await (const chunk of request) body += chunk;
+  editorRequests.push(JSON.parse(body));
+  response.writeHead(200, { 'Content-Type': 'application/json' });
+  response.end('null');
+});
+await new Promise((resolve, reject) => { editor.once('error', reject); editor.listen(editorSocket, resolve); });
 const log = fs.openSync(path.join(work, 'bridge.log'), 'a');
 const bridge = spawn(process.execPath, [fileURLToPath(new URL('./typst-sumatra.mjs', import.meta.url)),
-  'watch', '--root', work, input, pdf], { stdio: ['ignore', log, log] });
+  'watch', '--root', work, input, pdf], { stdio: ['ignore', log, log],
+  env: { ...process.env, VSCODE_IPC_HOOK_CLI: editorSocket } });
 fs.closeSync(log);
 let metadata;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -55,6 +69,47 @@ try {
   status = await api('status');
   assert.equal(status.mapperPaused, true, 'A cache hit must not wake the mapper');
   assert.equal(status.timings.lastResolveCacheHit, true);
+  // Record 1 is page 1's empty top-left margin: five negative source replies,
+  // then nearby real text. The old log matcher timed out on the first reply.
+  const blank = await api('resolve', { id: 1 });
+  assert.equal(blank.filepath, input);
+  assert.equal(blank.line, 1);
+  assert.equal(blank.approximate, true);
+  assert.equal((await api('status')).mapperPid, status.mapperPid,
+    'A negative source reply must not discard the warmed mapper');
+  console.log('Empty-margin fallback (ms):', (await api('status')).timings.lastResolveMs);
+  assert.equal(editorRequests.length, 0, 'Resolve-only requests must not open the editor');
+  const unauthorised = await fetch(`http://127.0.0.1:${metadata.port}/resolve`, {
+    method: 'POST', body: JSON.stringify({ id, open: true }),
+  });
+  assert.equal(unauthorised.status, 403);
+  assert.equal(editorRequests.length, 0);
+  for (let i = 0; i < 2; i++) {
+    assert.deepEqual(await api('resolve', { id, open: true }), { ...first, opened: true });
+    assert.equal(editorRequests.length, i + 1, 'Each cached click must still open its location');
+    assert.equal(editorRequests[i].fileURIs[0], pathToFileURL(`${input}:${first.line}:${first.column}`).href);
+    assert.equal(editorRequests[i].gotoLineMode, true);
+    assert.equal(editorRequests[i].forceReuseWindow, true);
+  }
+  if (process.env.TYPST_SUMATRA_CLIENT) {
+    const windowsMetadata = `\\\\wsl.localhost\\${process.env.WSL_DISTRO_NAME || 'Ubuntu'}${metadataFile.replaceAll('/', '\\')}`;
+    const result = await new Promise((resolve, reject) => {
+      const client = spawn(process.env.TYPST_SUMATRA_CLIENT, [windowsMetadata, String(id), '1'], {
+        cwd: '/mnt/c/Windows', stdio: ['ignore', 'pipe', 'pipe'],
+        // Fail closed if IPC regresses; a test must never fall back to the real GUI.
+        env: { ...process.env, TYPST_SUMATRA_CODE_ROOT: 'C:\\typst-sumatra-no-real-editor',
+          WSLENV: (process.env.WSLENV || '') + ':TYPST_SUMATRA_CODE_ROOT' },
+      });
+      let errors = '';
+      client.stderr.on('data', data => { errors += data; });
+      client.once('error', reject);
+      client.once('exit', code => resolve({ code, errors }));
+    });
+    assert.equal(result.code, 0, result.errors);
+    assert.equal(editorRequests.length, 3);
+    assert.equal((await api('status')).editor.lastRequest.transport, 'vscode-ipc');
+    console.log('PASS: native Windows client → real bridge → mock editor IPC, without Code.exe.');
+  }
   const oldRevision = status.revision, oldPid = status.mapperPid;
   fs.writeFileSync(input, '\n\nAlpha beta gamma.\n');
   status = await waitFor(s => s.revision > oldRevision && s.mappingReady && s.mapperReady && s.mapperPaused);
@@ -71,9 +126,13 @@ try {
   await waitFor(s => s.revision > revision && s.mappingReady && s.mapperReady && s.mapperPaused);
   const final = await api('resolve', { id: firstRecord() });
   assert.equal(final.line, 4);
-  console.log('PASS: authentication, eager warmup, cached fast path, edit invalidation and rapid edits.');
+  await new Promise(resolve => editor.close(resolve));
+  assert.equal((await api('resolve', { id: firstRecord(), open: true })).opened, false);
+  assert.equal((await api('status')).editor.lastRequest.transport, 'cli-fallback');
+  console.log('PASS: authentication, eager warmup, cached fast path, edit invalidation, rapid edits and IPC fallback.');
   console.log('Persistent fixture:', work);
 } finally {
+  if (editor.listening) await new Promise(resolve => editor.close(resolve));
   try { await api('shutdown', {}); } catch { bridge.kill(); }
   for (let i = 0; i < 60 && bridge.exitCode === null; i++) await pause(50);
   if (bridge.exitCode === null) bridge.kill('SIGKILL');
