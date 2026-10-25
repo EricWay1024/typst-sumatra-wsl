@@ -1,0 +1,14 @@
+/scratch/
+/build/
+*.exe
+*.dll
+*.pdb
+*.pdf
+*.synctex
+*.synctex.gz
+*.typst-sync.json
+*.log
+__pycache__/
+*.pyc
+.env
+.env.*

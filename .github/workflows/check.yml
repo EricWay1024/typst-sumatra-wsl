@@ -1,0 +1,37 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  javascript:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --check typst-sumatra.mjs && node --check integration-test.mjs
+      - run: node --test test.mjs
+      - run: bash -n install.sh bin/typst-sumatra windows/build.sh
+      - name: Check Python syntax without writing bytecode
+        run: python3 -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('.').glob('*.py')]"
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile native launcher
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          & $csc /nologo /target:winexe /optimize+ /reference:System.Web.Extensions.dll /out:build\open-in-vscode.exe windows\OpenInVSCode.cs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

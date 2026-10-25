@@ -1,0 +1,16 @@
+#!/bin/bash
+set -e
+runtime="$(command -v node || true)"
+if [[ -z "$runtime" ]] || ! "$runtime" -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)' 2>/dev/null; then
+  runtime=""
+  for candidate in "$HOME"/.nvm/versions/node/*/bin/node; do
+    if [[ -x "$candidate" ]] && "$candidate" -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)' 2>/dev/null; then
+      runtime="$candidate"
+    fi
+  done
+fi
+if [[ -z "$runtime" ]]; then
+  echo "Node.js was not found for the Typst/Sumatra bridge." >&2
+  exit 1
+fi
+exec "$runtime" "$HOME/.local/lib/typst-sumatra/typst-sumatra.mjs" "$@"
