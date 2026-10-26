@@ -229,7 +229,7 @@ extension host. From this repository in a VS Code WSL terminal:
 ```bash
 export TYPST_SUMATRA_SCRATCH="$PWD/scratch"
 python3 -B vscode-extension/package.py
-code --install-extension "$TYPST_SUMATRA_SCRATCH/typst-sumatra-wsl-0.1.0.vsix"
+code --install-extension "$TYPST_SUMATRA_SCRATCH/typst-sumatra-wsl-0.1.1.vsix"
 ```
 
 The package is built locally with Python's standard library; no npm downloads or
@@ -238,8 +238,8 @@ extension update, reload once to activate the new version. When upgrading an exi
 `bash install.sh` and stop/restart its watcher too. An older running watcher will
 not gain forward search merely because its files changed on disk.
 
-**Save your `.typ` file, then hold Ctrl and click a word.** The tooltip says
-“Show in Sumatra”. The extension finds a running bridge via its metadata, reuses
+**Save your `.typ` file, then hold Ctrl and click a word.** Text stays visually
+normal—no blanket underlining. The tooltip says “Show in Sumatra”. The extension finds a running bridge via its metadata, reuses
 the same mapper, and asks Sumatra to highlight the corresponding SyncTeX word.
 It does not modify or automatically save your document, replace Tinymist, or add
 another compiler. There is also a **Show in Sumatra** editor context-menu command.

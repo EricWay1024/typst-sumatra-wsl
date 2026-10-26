@@ -5,7 +5,7 @@ const core = require('./core.cjs');
 const { createExtension, activate } = require('./extension.cjs');
 
 function fixture(overrides = {}) {
-  const calls = [], warnings = [], logs = [], registered = [];
+  const calls = [], warnings = [], logs = [], registered = [], decorations = [], styles = [], events = {};
   const text = 'α 𝒜 needle\nsecond line';
   const uri = { scheme: 'file', fsPath: '/project/chapter.typ', toString: () => 'file:///project/chapter.typ' };
   const document = { uri, version: 1, languageId: 'typst', isDirty: false, lineCount: 2,
@@ -21,13 +21,21 @@ function fixture(overrides = {}) {
     RelativePattern: class {},
     workspace: { isTrusted: true, getWorkspaceFolder: () => ({ uri: { fsPath: '/project' } }),
       getConfiguration: () => ({ get: (_key, fallback) => fallback }),
-      onDidChangeConfiguration: () => ({ dispose() {} }), findFiles: async () => [] },
-    window: { activeTextEditor: { document, selection: { active: { line: 0, character: 5 } } },
+      onDidChangeConfiguration: listener => { events.configuration = listener; return { dispose() {} }; },
+      onDidChangeTextDocument: listener => { events.document = listener; return { dispose() {} }; },
+      findFiles: async () => [] },
+    window: { activeTextEditor: { document, selection: { active: { line: 0, character: 5 } },
+        setDecorations: (style, ranges) => decorations.push({ style, ranges }) },
+      createTextEditorDecorationType: options => {
+        const style = { options, dispose() { this.disposed = true; } }; styles.push(style); return style;
+      },
+      onDidChangeVisibleTextEditors: listener => { events.visible = listener; return { dispose() {} }; },
       createOutputChannel: () => ({ appendLine: text => logs.push(text), dispose() {} }),
       showWarningMessage: text => warnings.push(text), showQuickPick: async picks => picks[0] },
     languages: { registerDocumentLinkProvider: (selector, provider) => { registered.push({ selector, provider }); return {}; } },
     commands: { registerCommand: (name, handler) => { registered.push({ name, handler }); return {}; } },
   };
+  vscode.window.visibleTextEditors = [vscode.window.activeTextEditor];
   const context = { subscriptions: [], workspaceState: { get: () => undefined, update: async () => {} } };
   const dependencies = {
     candidates: async () => ['/project/.main.typst-sync.json'],
@@ -41,7 +49,7 @@ function fixture(overrides = {}) {
     ...overrides,
   };
   const api = createExtension(vscode, context, dependencies);
-  return { api, vscode, context, document, target, calls, warnings, logs, registered, dependencies };
+  return { api, vscode, context, document, target, calls, warnings, logs, registered, dependencies, decorations, styles, events };
 }
 
 test('link registration is Typst-only and does not replace F12 or add global keybindings', () => {
@@ -68,6 +76,25 @@ test('word links preserve UTF-16 coordinates; hovering performs no lookup or lau
   assert.deepEqual(f.api.links.provideDocumentLinks(f.document, { isCancellationRequested: true }), []);
   f.vscode.workspace.isTrusted = false;
   assert.deepEqual(f.api.links.provideDocumentLinks(f.document, {}), []);
+});
+
+test('PDF links are not permanently underlined; other languages keep their link styling', () => {
+  const f = fixture();
+  assert.deepEqual(f.styles[0].options, { textDecoration: 'none !important' });
+  assert.deepEqual(f.decorations.at(-1).ranges.map(r => r.args), [[0, 0, 1, 11]]);
+  f.document.lineAt = () => ({ text: 'edited line' });
+  f.events.document({ document: f.document });
+  assert.equal(f.decorations.length, 2);
+  const other = { ...f.document, languageId: 'javascript' }, otherDecorations = [];
+  f.vscode.window.visibleTextEditors.push({ document: other, setDecorations: (_style, ranges) => otherDecorations.push(ranges) });
+  f.events.visible();
+  assert.deepEqual(otherDecorations, [[]]);
+  f.vscode.workspace.getConfiguration = () => ({ get: () => false });
+  f.events.configuration({ affectsConfiguration: () => true });
+  assert.deepEqual(f.decorations.at(-1).ranges, []);
+  assert.deepEqual(f.api.links.provideDocumentLinks(f.document, {}), []);
+  for (const subscription of f.context.subscriptions) subscription.dispose();
+  assert.equal(f.styles[0].disposed, true);
 });
 
 test('click sends a content hash and coordinates, then launches only the returned PDF target', async () => {

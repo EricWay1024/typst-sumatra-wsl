@@ -13,6 +13,24 @@ function createExtension(vscode, context, dependencies = {}) {
   const enabled = document => vscode.env.remoteName === 'wsl' && vscode.workspace.isTrusted && document.languageId === 'typst' &&
     document.uri.scheme === 'file' && vscode.workspace.getConfiguration('typstSumatra', document.uri).get('ctrlClick', true);
 
+  // VS Code underlines every DocumentLink, even when Ctrl is not pressed.
+  // A local editor decoration removes that visual noise without disabling links
+  // or changing global CSS/settings. One range avoids per-word decoration cost.
+  const plainLinks = vscode.window.createTextEditorDecorationType({ textDecoration: 'none !important' });
+  function refreshAppearance(document) {
+    for (const editor of vscode.window.visibleTextEditors) {
+      if (document && editor.document !== document) continue;
+      const doc = editor.document;
+      const end = doc.lineCount - 1;
+      editor.setDecorations(plainLinks, enabled(doc)
+        ? [new vscode.Range(0, 0, end, doc.lineAt(end).text.length)] : []);
+    }
+  }
+  context.subscriptions.push(plainLinks,
+    vscode.window.onDidChangeVisibleTextEditors(() => refreshAppearance()),
+    vscode.workspace.onDidChangeTextDocument(event => refreshAppearance(event.document)));
+  refreshAppearance();
+
   const links = {
     provideDocumentLinks(document, token) {
       if (!enabled(document)) return [];
@@ -133,7 +151,9 @@ function createExtension(vscode, context, dependencies = {}) {
   const changed = new vscode.EventEmitter();
   links.onDidChangeDocumentLinks = changed.event;
   context.subscriptions.push(changed, vscode.workspace.onDidChangeConfiguration(event => {
-    if (event.affectsConfiguration('typstSumatra')) { executable = undefined; changed.fire(); }
+    if (event.affectsConfiguration('typstSumatra')) {
+      executable = undefined; refreshAppearance(); changed.fire();
+    }
   }));
   context.subscriptions.push({ dispose() { previous?.abort(); } });
   return { links, show, selectPdf, output };
