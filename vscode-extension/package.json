@@ -1,0 +1,35 @@
+{
+  "name": "typst-sumatra-wsl",
+  "displayName": "Typst / Sumatra: Ctrl+Click to PDF",
+  "description": "Ctrl+click Typst source in WSL to jump to its PDF in Windows SumatraPDF.",
+  "version": "0.1.0",
+  "publisher": "ericway1024",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onLanguage:typst"],
+  "main": "./extension.cjs",
+  "repository": { "type": "git", "url": "https://github.com/EricWay1024/typst-sumatra-wsl" },
+  "capabilities": { "untrustedWorkspaces": { "supported": false }, "virtualWorkspaces": false },
+  "contributes": {
+    "languages": [{ "id": "typst", "extensions": [".typ"], "aliases": ["Typst"] }],
+    "commands": [
+      { "command": "typstSumatra.showInPdf", "title": "Show in Sumatra", "category": "Typst/Sumatra", "enablement": "editorLangId == typst" },
+      { "command": "typstSumatra.selectPdf", "title": "Select PDF", "category": "Typst/Sumatra", "enablement": "editorLangId == typst" }
+    ],
+    "menus": { "editor/context": [{ "command": "typstSumatra.showInPdf", "when": "editorLangId == typst", "group": "navigation" }] },
+    "configuration": {
+      "title": "Typst / Sumatra",
+      "properties": {
+        "typstSumatra.ctrlClick": {
+          "type": "boolean", "default": true, "scope": "resource",
+          "description": "Make words in Typst files PDF links. Ctrl+click follows them with the default VS Code mouse settings. F12 still goes to definitions."
+        },
+        "typstSumatra.sumatraPath": {
+          "type": "string", "default": "", "scope": "machine",
+          "description": "Optional absolute WSL or Windows drive path to SumatraPDF.exe. Otherwise discover the per-user or Program Files installation."
+        }
+      }
+    }
+  }
+}

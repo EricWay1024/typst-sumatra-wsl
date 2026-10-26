@@ -18,11 +18,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: node --check typst-sumatra.mjs && node --check integration-test.mjs
-      - run: node --test test.mjs editor-ipc.test.mjs
+      - run: node --check typst-sumatra.mjs && node --check integration-test.mjs && node --check forward-integration-test.mjs && node --check vscode-extension/extension.cjs
+      - run: node --test test.mjs editor-ipc.test.mjs forward.test.mjs vscode-extension/test.cjs
+      - run: python3 -B vscode-extension/package.py
       - run: bash -n install.sh bin/typst-sumatra windows/build.sh
       - name: Check Python syntax without writing bytecode
-        run: python3 -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('.').glob('*.py')]"
+        run: python3 -c "import ast,pathlib; [ast.parse(p.read_text()) for d in ['.', 'vscode-extension'] for p in pathlib.Path(d).glob('*.py')]"
 
   windows-build:
     runs-on: windows-latest

@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { openInEditor, editorSocket } from './editor-ipc.mjs';
+import { readForwardSource, parseJumpFrame, forwardRecord, normalWord } from './forward.mjs';
 
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -172,10 +173,12 @@ async function watch(config) {
   let mapperPromise = null, mapperReady = false, mapperPaused = false, idleTimer, warmupTimer, native;
   let shuttingDown = false, timings = {}, nativeStarted = 0, lastEditor = null;
   let sourceCache = new Map(), pointLookup = new Map(), pageLookup = new Map();
+  const forwardCache = new Map();
+  let lastForward = null;
   let queue = Promise.resolve(), pending = null, child;
   let control, dataSocket, controlPort, dataPort, errorLog = '', logBuffer = '';
   const token = crypto.randomBytes(24).toString('hex');
-  const metadata = { version: 3, ...config, token, port: 0, pid: process.pid };
+  const metadata = { version: 4, ...config, token, port: 0, pid: process.pid };
 
   const server = http.createServer(async (request, response) => {
     response.setHeader('Content-Type', 'application/json');
@@ -185,20 +188,24 @@ async function watch(config) {
       ready, mappingReady, input, pdf, lastResolved, timings, mapperRunning: !!child, mapperPaused,
       mapperReady, mapperPid: child?.pid ?? null, revision, cachedPositions: sourceCache.size,
       editor: { ...editorSocket(), lastRequest: lastEditor },
+      forwardSearch: true, lastForward,
     });
     if (request.method === 'POST' && request.url === '/shutdown') {
       reply(200, { stopped: true });
       setTimeout(() => shutdown(), 100);
       return;
     }
-    if (request.method !== 'POST' || request.url !== '/resolve') return reply(404, { error: 'Unknown bridge request' });
+    if (request.method !== 'POST' || !['/resolve', '/forward'].includes(request.url))
+      return reply(404, { error: 'Unknown bridge request' });
     try {
       let body = '';
       for await (const chunk of request) {
         body += chunk;
-        if (body.length > 2048) throw Error('Request too large');
+        if (body.length > 8192) throw Error('Request too large');
       }
-      const { id, open: openEditor } = JSON.parse(body);
+      const payload = JSON.parse(body);
+      if (request.url === '/forward') return reply(200, await resolveForward(payload, response));
+      const { id, open: openEditor } = payload;
       if (!Number.isInteger(id) || id < 1 || id > 2147483647) throw Error('Invalid PDF source position');
       const started = Date.now(), deadline = started + 20000;
       const result = queue.then(async () => {
@@ -231,6 +238,78 @@ async function watch(config) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   metadata.port = server.address().port;
   writeAtomic(metadataFile, JSON.stringify(metadata));
+
+  async function resolveForward(payload, response) {
+    const started = Date.now(), deadline = started + 20000;
+    const result = queue.then(async () => {
+      const source = readForwardSource(root, payload);
+      // A saved buffer can arrive before the native watcher's change event.
+      // Do not use a PDF whose publication predates that save.
+      while ((!mappingReady || Date.parse(timings.pdfUpdatedAt) < source.modifiedAt) &&
+          Date.now() < deadline && !response.destroyed) await pause(40);
+      if (response.destroyed || Date.now() >= deadline) throw Error('Waiting for the saved PDF timed out');
+      const version = revision;
+      const key = JSON.stringify([source.filepath, source.line, source.character, source.hash]);
+      const check = () => {
+        if (version !== revision || !mappingReady || Date.now() >= deadline)
+          throw Error('The PDF changed during forward search; click again');
+        readForwardSource(root, payload); // Reject an edit made while mapping was in flight.
+      };
+      check();
+      if (forwardCache.has(key)) { timings.lastForwardCacheHit = true; return forwardCache.get(key); }
+      timings.lastForwardCacheHit = false;
+      try {
+        await ensureMapper();
+        check();
+        const positions = await query({ filepath: source.filepath, line: source.line,
+          character: source.character }, 'forward');
+        check();
+        const location = await refineForward(source, positions, check);
+        check();
+        const target = { ...location, revision: version,
+          pdf: windowsPath(pdf), source: windowsPath(metadataFile) };
+        forwardCache.set(key, target);
+        return target;
+      } finally { scheduleMapperPause(); }
+    });
+    queue = result.catch(() => {});
+    const target = await result;
+    timings.lastForwardMs = Date.now() - started;
+    lastForward = { filepath: payload.filepath, line: payload.line, column: payload.column,
+      ...target, time: new Date().toISOString() };
+    return target;
+  }
+
+  async function refineForward(source, positions, check) {
+    // Typst 0.14.2 returns the first glyph of a syntax span on each page, not
+    // the clicked character. Verify matching PDF words through inverse lookup.
+    // The 32-probe cap is a latency choice, not a completeness claim; if it is
+    // exhausted, return an explicitly approximate span anchor instead.
+    let probes = 0;
+    for (const position of positions) {
+      const candidates = (pageLookup.get(position.page) || []).filter(word =>
+        source.word && normalWord(word.text) === source.word);
+      candidates.sort((a, b) =>
+        ((a.box[0] - position.x) ** 2 + (a.box[1] - position.y) ** 2) -
+        ((b.box[0] - position.x) ** 2 + (b.box[1] - position.y) ** 2));
+      for (const word of candidates) {
+        if (++probes > 32) break;
+        const [a, b, c, d] = word.box;
+        const x = (a + c) / 2, y = (b + d) / 2;
+        let mapped = sourceCache.get(word.id);
+        if (!mapped || mapped.approximate) mapped = await query({ page_no: position.page, x, y });
+        check();
+        if (!mapped) continue;
+        sourceCache.set(word.id, mapped);
+        if (mapped.filepath === source.filepath && mapped.line === source.line + 1 &&
+            mapped.column - 1 >= source.tokenStart && mapped.column - 1 < source.tokenEnd)
+          return { page: position.page, x, y, record: word.id, candidatePages: positions.length,
+            approximate: false, accuracy: 'word' };
+      }
+      if (probes > 32) break;
+    }
+    return forwardRecord(positions, pageLookup);
+  }
 
   function schedule() {
     dirty = true;
@@ -313,18 +392,24 @@ async function watch(config) {
     throw Error('No Typst source position was found near this PDF text.');
   }
 
-  function query(position) {
+  function query(position, direction = 'inverse') {
     return new Promise((resolve, reject) => {
       if (!dataSocket || dataSocket.readyState !== WebSocket.OPEN) return reject(Error('Typst source mapper disconnected'));
       const deadline = setTimeout(() => {
-        pending.fail(Error('Typst source-position query timed out'));
+        pending.fail(Error(direction === 'forward'
+          ? 'No PDF position received; this text may not be rendered in the selected PDF'
+          : 'Typst source-position query timed out'));
         // Replies have no request IDs. Discard this connection so a late reply
         // cannot be mistaken for the result of the next click.
         stopMapper();
       }, 3000);
       pending = result => { clearTimeout(deadline); pending = null; resolve(result); };
       pending.fail = error => { clearTimeout(deadline); pending = null; reject(error); };
-      try { dataSocket.send('src-point ' + JSON.stringify(position)); }
+      pending.direction = direction;
+      try {
+        if (direction === 'forward') control.send(JSON.stringify({ event: 'panelScrollTo', ...position }));
+        else dataSocket.send('src-point ' + JSON.stringify(position));
+      }
       catch (error) { pending.fail(error); stopMapper(); };
     });
   }
@@ -391,7 +476,7 @@ async function watch(config) {
           // v0.14.20 logs FrameLoc results as WebviewResolveSpan (despite the
           // request name). Missing this negative reply wastes the 3 s timeout
           // and prevents the nearby-text fallback from ever being attempted.
-          if (/resolved WebviewResolve(?:Span|FrameLoc): None/.test(line)) pending?.(null);
+          if (pending?.direction === 'inverse' && /resolved WebviewResolve(?:Span|FrameLoc): None/.test(line)) pending(null);
           if (line.includes('compilation succeeded')) mapperReady = true;
         }
       });
@@ -410,6 +495,14 @@ async function watch(config) {
       const socket = port => new WebSocket(`ws://127.0.0.1:${port}`, { headers: { Origin: `http://127.0.0.1:${port}` } });
       control = socket(controlPort);
       dataSocket = socket(dataPort);
+      dataSocket.binaryType = 'arraybuffer';
+      dataSocket.addEventListener('message', event => {
+        if (child !== instance || pending?.direction !== 'forward') return;
+        try {
+          const positions = parseJumpFrame(event.data);
+          if (positions !== null) pending(positions);
+        } catch (error) { pending?.fail(error); stopMapper(); }
+      });
       for (const ws of [control, dataSocket]) ws.addEventListener('close', () => {
         if (child !== instance) return;
         mapperReady = false;
@@ -420,7 +513,8 @@ async function watch(config) {
         const message = JSON.parse(event.data);
         if (message.event === 'editorScrollTo') {
           const position = message.start || message.end;
-          pending?.({ filepath: message.filepath, line: position[0] + 1, column: position[1] + 1 });
+          if (pending?.direction === 'inverse')
+            pending({ filepath: message.filepath, line: position[0] + 1, column: position[1] + 1 });
         } else if (message.event === 'compileStatus') {
           if (message.kind === 'Compiling') mapperReady = false;
           if (message.kind === 'CompileSuccess') mapperReady = true;
@@ -462,7 +556,7 @@ async function watch(config) {
       if (line.includes('compiling ...')) {
         revision++; nativeStarted = Date.now(); mappingReady = false;
         dirty = false; clearTimeout(timer); clearTimeout(warmupTimer);
-        stopMappingWorker(); stopMapper(); sourceCache.clear();
+        stopMappingWorker(); stopMapper(); sourceCache.clear(); forwardCache.clear();
       } else if (line.includes('compiled successfully')) {
         // typst watch has already closed and published the PDF at this point.
         // This handler schedules mapping only; it never compiles or writes PDFs.

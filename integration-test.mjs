@@ -57,7 +57,7 @@ const firstRecord = () => Number(fs.readFileSync(path.join(work, 'test.synctex')
 try {
   let status = await waitFor(s => s.mappingReady && s.mapperReady && s.mapperPaused);
   console.log('Background warmup:', status.timings);
-  assert.equal(metadata.version, 3);
+  assert.equal(metadata.version, 4);
   const forbidden = await fetch(`http://127.0.0.1:${metadata.port}/status`);
   assert.equal(forbidden.status, 403);
   let id = firstRecord();
