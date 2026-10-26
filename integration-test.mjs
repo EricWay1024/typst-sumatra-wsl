@@ -31,7 +31,7 @@ const bridge = spawn(process.execPath, [fileURLToPath(new URL('./typst-sumatra.m
   'watch', '--root', work, input, pdf], { stdio: ['ignore', log, log],
   env: { ...process.env, VSCODE_IPC_HOOK_CLI: editorSocket } });
 fs.closeSync(log);
-let metadata;
+let metadata, reloadedEditor;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function api(url, body) {
   metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
@@ -129,9 +129,30 @@ try {
   await new Promise(resolve => editor.close(resolve));
   assert.equal((await api('resolve', { id: firstRecord(), open: true })).opened, false);
   assert.equal((await api('status')).editor.lastRequest.transport, 'cli-fallback');
+  const renewedSocket = path.join(ipcScratch, `vscode-ipc-reload-${process.pid}.sock`);
+  const renewedRequests = [];
+  reloadedEditor = http.createServer(async (request, response) => {
+    let body = ''; for await (const chunk of request) body += chunk;
+    renewedRequests.push(JSON.parse(body)); response.end('null');
+  });
+  await new Promise((resolve, reject) => { reloadedEditor.once('error', reject); reloadedEditor.listen(renewedSocket, resolve); });
+  const registration = { socketPath: renewedSocket, workspaceFolders: [work] };
+  assert.equal((await fetch(`http://127.0.0.1:${metadata.port}/editor`, { method: 'POST', body: JSON.stringify(registration) })).status, 403);
+  await assert.rejects(api('editor', { ...registration, workspaceFolders: [path.join(work, 'scratch')] }), /does not contain/);
+  const prior = await api('status');
+  assert.deepEqual(await api('editor', registration), { bound: true });
+  assert.equal((await api('resolve', { id: firstRecord(), open: true })).opened, true);
+  status = await api('status');
+  assert.equal(status.editorRegistration, true);
+  assert.equal(status.editor.socketPath, renewedSocket);
+  assert.equal(status.editor.lastRequest.transport, 'vscode-ipc');
+  assert.equal(status.mapperPid, prior.mapperPid, 'Rebinding must not restart compilation');
+  assert.equal(renewedRequests.length, 1);
+  console.log('PASS: authenticated project/window renewal restores editor IPC after the old socket closes.');
   console.log('PASS: authentication, eager warmup, cached fast path, edit invalidation, rapid edits and IPC fallback.');
   console.log('Persistent fixture:', work);
 } finally {
+  if (reloadedEditor?.listening) await new Promise(resolve => reloadedEditor.close(resolve));
   if (editor.listening) await new Promise(resolve => editor.close(resolve));
   try { await api('shutdown', {}); } catch { bridge.kill(); }
   for (let i = 0; i < 60 && bridge.exitCode === null; i++) await pause(50);

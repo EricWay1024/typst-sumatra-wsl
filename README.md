@@ -229,7 +229,7 @@ extension host. From this repository in a VS Code WSL terminal:
 ```bash
 export TYPST_SUMATRA_SCRATCH="$PWD/scratch"
 python3 -B vscode-extension/package.py
-code --install-extension "$TYPST_SUMATRA_SCRATCH/typst-sumatra-wsl-0.1.1.vsix"
+code --install-extension "$TYPST_SUMATRA_SCRATCH/typst-sumatra-wsl-0.1.2.vsix"
 ```
 
 The package is built locally with Python's standard library; no npm downloads or
@@ -272,7 +272,13 @@ instead; this extension does not change that global setting. Set
 - **Window selection is deliberate.** A watcher started inside the intended
   VS Code terminal can inherit `VSCODE_IPC_HOOK_CLI`. Otherwise, the bridge uses a
   unique active, same-user CLI socket. Missing, ambiguous or unresponsive sockets
-  fall back to the CLI. A stale explicit binding is not redirected to another window.
+  fall back to the CLI. Socket discovery never redirects a stale explicit binding.
+  The optional extension renews its own binding after a reload via authenticated
+  `/editor` registration. The socket must be an active same-user listener, and
+  the window's workspace must contain the document's main input. Background
+  registration cannot displace a different live window; an explicit source click
+  or PDF selection can select its own window. With several possible PDFs, select
+  one first rather than having background registration guess.
 - **Keep the capability token private.** The hidden `.typst-sync.json` metadata
   beside the PDF contains it. Do not publish that file, expose the loopback HTTP
   service to a network, or remove authentication. “Local-first” is not permission
@@ -308,6 +314,14 @@ file's hash and UTF-16 cursor coordinates. The bridge converts columns to the
 pinned mapper's Unicode-scalar convention, requests source-to-document anchors,
 and verifies candidate words through inverse lookup. Forward and inverse queries
 share one serial queue because the mapper protocol has no request IDs.
+Cancelled queued requests are skipped; an already-running request drains its
+current mapper reply, then stops before further probes. It does not release the
+queue early or discard a healthy mapper. A shared warmup may still need to finish.
+
+The extension renews editor registration on activation, source-editor/focus
+changes and bridge-metadata creation/updates. This is independent of hovering
+PDF links and does not open a viewer or editor. It leaves older bridges usable
+if they do not support registration.
 
 The extension launches Sumatra with `-reuse-instance -forward-search`, using the
 bridge metadata filename and the coordinate record as SyncTeX's source/line pair.

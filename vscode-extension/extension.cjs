@@ -3,7 +3,7 @@ const core = require('./core.cjs');
 const command = 'typstSumatra.showInPdf';
 
 function createExtension(vscode, context, dependencies = {}) {
-  const services = { ...core, ...dependencies };
+  const services = { ...core, editorSocket: () => process.env.VSCODE_IPC_HOOK_CLI, ...dependencies };
   const output = vscode.window.createOutputChannel('Typst / Sumatra');
   context.subscriptions.push(output);
   const chosen = new Map();
@@ -52,7 +52,7 @@ function createExtension(vscode, context, dependencies = {}) {
     },
   };
 
-  async function bridgeFor(document, signal) {
+  async function bridgeFor(document, signal, interactive = true) {
     const source = document.uri.fsPath, root = rootFor(document), cacheKey = path.dirname(source);
     const explicit = context.workspaceState.get(selectionKey(document));
     const remembered = explicit || chosen.get(cacheKey);
@@ -76,6 +76,7 @@ function createExtension(vscode, context, dependencies = {}) {
     if (!active.length) throw Error('No forward-search bridge found. Start the updated typst-sumatra watcher, or run “Typst/Sumatra: Select PDF”.');
     let selected = active.find(item => item.input === source);
     if (!selected && active.length === 1) selected = active[0];
+    if (!selected && !interactive) return;
     if (!selected) {
       const pick = await vscode.window.showQuickPick(active.map(metadata => ({
         label: path.basename(metadata.pdf), description: metadata.pdf, metadata,
@@ -84,6 +85,47 @@ function createExtension(vscode, context, dependencies = {}) {
     }
     if (selected) chosen.set(cacheKey, selected.metadataFile);
     return selected;
+  }
+
+  async function registerEditor(metadata, explicit, signal) {
+    const socketPath = services.editorSocket();
+    const workspaceFolders = (vscode.workspace.workspaceFolders || [])
+      .filter(folder => folder.uri.scheme === 'file').map(folder => folder.uri.fsPath);
+    if (!socketPath || !workspaceFolders.length || !vscode.workspace.isTrusted || vscode.env.remoteName !== 'wsl') return;
+    try {
+      await services.request(metadata, 'editor', { socketPath, workspaceFolders, explicit }, { signal, timeout: 1500 });
+    } catch (error) {
+      // Registration is an optional inverse-search optimization, not a reason
+      // to break forward search against an older or temporarily unavailable bridge.
+      if (!signal?.aborted) output.appendLine(`Editor registration unavailable: ${error.message}`);
+    }
+  }
+
+  let bindingTimer, bindingController, bindingDisposed = false;
+  async function refreshBinding() {
+    bindingController?.abort();
+    const controller = bindingController = new AbortController();
+    const document = vscode.window.activeTextEditor?.document;
+    if (bindingDisposed || !services.editorSocket() || !document || document.languageId !== 'typst' ||
+        document.uri.scheme !== 'file' || !vscode.workspace.isTrusted || vscode.env.remoteName !== 'wsl') return;
+    try {
+      const metadata = await bridgeFor(document, controller.signal, false);
+      if (metadata && !bindingDisposed && !controller.signal.aborted && vscode.window.activeTextEditor?.document === document)
+        await registerEditor(metadata, false, controller.signal);
+    } catch { /* No running/unique bridge yet: retry on metadata creation or editor focus. */ }
+  }
+  function startBinding() {
+    const schedule = () => {
+      clearTimeout(bindingTimer);
+      bindingTimer = setTimeout(() => { void refreshBinding(); }, 200);
+      bindingTimer.unref?.();
+    };
+    const watcher = vscode.workspace.createFileSystemWatcher('**/.*.typst-sync.json');
+    context.subscriptions.push(watcher, watcher.onDidCreate(schedule), watcher.onDidChange(schedule),
+      vscode.window.onDidChangeActiveTextEditor(schedule),
+      vscode.window.onDidChangeWindowState(state => { if (state.focused) schedule(); }),
+      { dispose() { bindingDisposed = true; clearTimeout(bindingTimer); bindingController?.abort(); } });
+    schedule();
   }
 
   async function show(uriString, version, line, character) {
@@ -113,6 +155,8 @@ function createExtension(vscode, context, dependencies = {}) {
       const metadata = await bridgeFor(document, controller.signal);
       if (!metadata || ticket !== serial) return;
       if (metadata.version < 4) throw Error('Update the Linux bridge and restart its watcher to enable forward search');
+      await registerEditor(metadata, true, controller.signal);
+      if (ticket !== serial) return;
       const target = await services.request(metadata, 'forward', {
         filepath: document.uri.fsPath, line: line + 1, column: character + 1, sourceHash,
       }, { signal: controller.signal });
@@ -141,9 +185,10 @@ function createExtension(vscode, context, dependencies = {}) {
     if (!picked?.length) return;
     try {
       const file = services.metadataPath(picked[0].fsPath);
-      await services.loadMetadata(file, document.uri.fsPath);
+      const metadata = await services.loadMetadata(file, document.uri.fsPath);
       await context.workspaceState.update(selectionKey(document), file);
       chosen.set(path.dirname(document.uri.fsPath), file);
+      await registerEditor(metadata, true);
       vscode.window.showInformationMessage('Typst/Sumatra: PDF selected. Ctrl+click Typst text to jump.');
     } catch (error) { vscode.window.showWarningMessage(`Typst/Sumatra: ${error.message}`); }
   }
@@ -156,7 +201,7 @@ function createExtension(vscode, context, dependencies = {}) {
     }
   }));
   context.subscriptions.push({ dispose() { previous?.abort(); } });
-  return { links, show, selectPdf, output };
+  return { links, show, selectPdf, output, startBinding, refreshBinding };
 }
 
 function activate(context) {
@@ -167,6 +212,7 @@ function activate(context) {
     vscode.commands.registerCommand(command, api.show),
     vscode.commands.registerCommand('typstSumatra.selectPdf', api.selectPdf),
   );
+  api.startBinding();
   api.output.appendLine('Typst-only PDF links registered. Ctrl+click follows PDF links; F12 remains Go to Definition.');
   return api;
 }

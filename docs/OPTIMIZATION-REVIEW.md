@@ -4,6 +4,20 @@ Audited implementation: `e118935`. This review and its benchmark do **not** chan
 or redeploy the bridge or VS Code extension. No document contents or capability
 tokens are included here.
 
+## Implementation follow-up
+
+Priorities 1 and 2 below are implemented after this audit (extension 0.1.2):
+project-scoped, authenticated editor registration and cancellation guards around
+queued work, warmup and mapper queries. The original findings are retained below
+as the record of what motivated the changes; priorities 3 and 4 remain proposals.
+
+Verification: 41 unit/extension tests, including real HTTP aborts around a
+controlled outstanding mapper reply and a cancelled queued request; native
+compiler integration covering old-socket closure and registration of a new mock
+editor without restarting the mapper; and the existing real forward/SyncTeX
+integration. The cancellation test checks probe counts and queue ordering, not
+GUI latency. These changes do not implement incremental mapper reuse.
+
 ## Priorities
 
 ### 1. Repair editor binding after window reloads

@@ -9,8 +9,8 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { gzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
-import { openInEditor, editorSocket } from './editor-ipc.mjs';
-import { readForwardSource, parseJumpFrame, forwardRecord, normalWord } from './forward.mjs';
+import { openInEditor, createEditorBinding } from './editor-ipc.mjs';
+import { readForwardSource, parseJumpFrame, refineForward, checkForwardRequest } from './forward.mjs';
 
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -166,6 +166,7 @@ async function watch(config) {
   const { input, pdf, root } = config;
   const tinymist = findTinymist();
   const metadataFile = metaPath(pdf);
+  const editorBinding = createEditorBinding(input);
   const workspace = fs.mkdtempSync(path.join(cacheDirectory(config), 'session-'));
   let revision = 0, building = false, dirty = false, timer;
   let ready = fs.existsSync(pdf) && fs.statSync(pdf).size > 0, points = [], lastResolved = null;
@@ -182,20 +183,23 @@ async function watch(config) {
 
   const server = http.createServer(async (request, response) => {
     response.setHeader('Content-Type', 'application/json');
-    const reply = (status, payload) => { response.statusCode = status; response.end(JSON.stringify(payload)); };
+    const reply = (status, payload) => {
+      if (response.destroyed) return;
+      response.statusCode = status; response.end(JSON.stringify(payload));
+    };
     if (request.headers.authorization !== `Bearer ${token}`) return reply(403, { error: 'Invalid bridge token' });
     if (request.method === 'GET' && request.url === '/status') return reply(200, {
       ready, mappingReady, input, pdf, lastResolved, timings, mapperRunning: !!child, mapperPaused,
       mapperReady, mapperPid: child?.pid ?? null, revision, cachedPositions: sourceCache.size,
-      editor: { ...editorSocket(), lastRequest: lastEditor },
-      forwardSearch: true, lastForward,
+      editor: { ...editorBinding.discover(), lastRequest: lastEditor },
+      editorRegistration: true, forwardSearch: true, lastForward,
     });
     if (request.method === 'POST' && request.url === '/shutdown') {
       reply(200, { stopped: true });
       setTimeout(() => shutdown(), 100);
       return;
     }
-    if (request.method !== 'POST' || !['/resolve', '/forward'].includes(request.url))
+    if (request.method !== 'POST' || !['/resolve', '/forward', '/editor'].includes(request.url))
       return reply(404, { error: 'Unknown bridge request' });
     try {
       let body = '';
@@ -204,6 +208,7 @@ async function watch(config) {
         if (body.length > 8192) throw Error('Request too large');
       }
       const payload = JSON.parse(body);
+      if (request.url === '/editor') return reply(200, editorBinding.register(payload));
       if (request.url === '/forward') return reply(200, await resolveForward(payload, response));
       const { id, open: openEditor } = payload;
       if (!Number.isInteger(id) || id < 1 || id > 2147483647) throw Error('Invalid PDF source position');
@@ -230,7 +235,7 @@ async function watch(config) {
       timings.lastResolveMs = Date.now() - started;
       lastResolved = { ...resolved, record: id, time: new Date().toISOString() };
       if (openEditor === true) {
-        lastEditor = { ...await openInEditor(resolved), time: new Date().toISOString() };
+        lastEditor = { ...await openInEditor(resolved, { discover: editorBinding.discover }), time: new Date().toISOString() };
         reply(200, { ...resolved, opened: lastEditor.opened });
       } else reply(200, resolved);
     } catch (error) { reply(500, { error: error.message }); }
@@ -242,16 +247,18 @@ async function watch(config) {
   async function resolveForward(payload, response) {
     const started = Date.now(), deadline = started + 20000;
     const result = queue.then(async () => {
+      checkForwardRequest(response, deadline);
       const source = readForwardSource(root, payload);
       // A saved buffer can arrive before the native watcher's change event.
       // Do not use a PDF whose publication predates that save.
       while ((!mappingReady || Date.parse(timings.pdfUpdatedAt) < source.modifiedAt) &&
           Date.now() < deadline && !response.destroyed) await pause(40);
-      if (response.destroyed || Date.now() >= deadline) throw Error('Waiting for the saved PDF timed out');
+      checkForwardRequest(response, deadline);
       const version = revision;
       const key = JSON.stringify([source.filepath, source.line, source.character, source.hash]);
       const check = () => {
-        if (version !== revision || !mappingReady || Date.now() >= deadline)
+        checkForwardRequest(response, deadline);
+        if (version !== revision || !mappingReady)
           throw Error('The PDF changed during forward search; click again');
         readForwardSource(root, payload); // Reject an edit made while mapping was in flight.
       };
@@ -264,7 +271,7 @@ async function watch(config) {
         const positions = await query({ filepath: source.filepath, line: source.line,
           character: source.character }, 'forward');
         check();
-        const location = await refineForward(source, positions, check);
+        const location = await refineForward(source, positions, { pageLookup, sourceCache, query, check });
         check();
         const target = { ...location, revision: version,
           pdf: windowsPath(pdf), source: windowsPath(metadataFile) };
@@ -278,37 +285,6 @@ async function watch(config) {
     lastForward = { filepath: payload.filepath, line: payload.line, column: payload.column,
       ...target, time: new Date().toISOString() };
     return target;
-  }
-
-  async function refineForward(source, positions, check) {
-    // Typst 0.14.2 returns the first glyph of a syntax span on each page, not
-    // the clicked character. Verify matching PDF words through inverse lookup.
-    // The 32-probe cap is a latency choice, not a completeness claim; if it is
-    // exhausted, return an explicitly approximate span anchor instead.
-    let probes = 0;
-    for (const position of positions) {
-      const candidates = (pageLookup.get(position.page) || []).filter(word =>
-        source.word && normalWord(word.text) === source.word);
-      candidates.sort((a, b) =>
-        ((a.box[0] - position.x) ** 2 + (a.box[1] - position.y) ** 2) -
-        ((b.box[0] - position.x) ** 2 + (b.box[1] - position.y) ** 2));
-      for (const word of candidates) {
-        if (++probes > 32) break;
-        const [a, b, c, d] = word.box;
-        const x = (a + c) / 2, y = (b + d) / 2;
-        let mapped = sourceCache.get(word.id);
-        if (!mapped || mapped.approximate) mapped = await query({ page_no: position.page, x, y });
-        check();
-        if (!mapped) continue;
-        sourceCache.set(word.id, mapped);
-        if (mapped.filepath === source.filepath && mapped.line === source.line + 1 &&
-            mapped.column - 1 >= source.tokenStart && mapped.column - 1 < source.tokenEnd)
-          return { page: position.page, x, y, record: word.id, candidatePages: positions.length,
-            approximate: false, accuracy: 'word' };
-      }
-      if (probes > 32) break;
-    }
-    return forwardRecord(positions, pageLookup);
   }
 
   function schedule() {

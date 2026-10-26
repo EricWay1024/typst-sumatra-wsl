@@ -19,7 +19,11 @@ function fixture(overrides = {}) {
     Uri: { parse: value => ({ toString: () => value }), file: fsPath => ({ fsPath }) },
     EventEmitter: class { constructor() { this.event = () => {}; } fire() {} dispose() {} },
     RelativePattern: class {},
-    workspace: { isTrusted: true, getWorkspaceFolder: () => ({ uri: { fsPath: '/project' } }),
+    workspace: { isTrusted: true, workspaceFolders: [{ uri: { scheme: 'file', fsPath: '/project' } }],
+      createFileSystemWatcher: () => ({ dispose() {},
+        onDidCreate: listener => { events.metadataCreate = listener; return { dispose() {} }; },
+        onDidChange: listener => { events.metadataChange = listener; return { dispose() {} }; } }),
+      getWorkspaceFolder: () => ({ uri: { fsPath: '/project' } }),
       getConfiguration: () => ({ get: (_key, fallback) => fallback }),
       onDidChangeConfiguration: listener => { events.configuration = listener; return { dispose() {} }; },
       onDidChangeTextDocument: listener => { events.document = listener; return { dispose() {} }; },
@@ -30,6 +34,8 @@ function fixture(overrides = {}) {
         const style = { options, dispose() { this.disposed = true; } }; styles.push(style); return style;
       },
       onDidChangeVisibleTextEditors: listener => { events.visible = listener; return { dispose() {} }; },
+      onDidChangeActiveTextEditor: listener => { events.active = listener; return { dispose() {} }; },
+      onDidChangeWindowState: listener => { events.focus = listener; return { dispose() {} }; },
       createOutputChannel: () => ({ appendLine: text => logs.push(text), dispose() {} }),
       showWarningMessage: text => warnings.push(text), showQuickPick: async picks => picks[0] },
     languages: { registerDocumentLinkProvider: (selector, provider) => { registered.push({ selector, provider }); return {}; } },
@@ -38,6 +44,7 @@ function fixture(overrides = {}) {
   vscode.window.visibleTextEditors = [vscode.window.activeTextEditor];
   const context = { subscriptions: [], workspaceState: { get: () => undefined, update: async () => {} } };
   const dependencies = {
+    editorSocket: () => undefined,
     candidates: async () => ['/project/.main.typst-sync.json'],
     loadMetadata: async file => ({ version: 4, metadataFile: file, input: '/project/main.typ', pdf: '/project/main.pdf', token: 'test-secret' }),
     request: async (_meta, route, body) => {
@@ -62,6 +69,7 @@ test('link registration is Typst-only and does not replace F12 or add global key
   assert.deepEqual(f.registered[0].selector, { language: 'typst', scheme: 'file', pattern: '**/*.typ' });
   assert.deepEqual(f.registered.slice(1).map(r => r.name), ['typstSumatra.showInPdf', 'typstSumatra.selectPdf']);
   assert.equal(require('./package.json').contributes.keybindings, undefined);
+  for (const subscription of f.context.subscriptions) subscription.dispose?.();
 });
 
 test('word links preserve UTF-16 coordinates; hovering performs no lookup or launch', () => {
@@ -104,6 +112,61 @@ test('click sends a content hash and coordinates, then launches only the returne
     { filepath: f.document.uri.fsPath, line: 1, column: 6, sourceHash: core.hash(f.document.getText()) });
   assert.equal(f.calls.at(-1).exe, '/fake/SumatraPDF.exe');
   assert.equal(f.calls.at(-1).target, f.target);
+  assert.deepEqual(f.warnings, []);
+});
+
+test('activation/restart binding uses this window and project; source clicks explicitly select their window', async () => {
+  let socket = '/run/user/42/vscode-ipc-first.sock';
+  const f = fixture({ editorSocket: () => socket });
+  await f.api.refreshBinding();
+  let registrations = f.calls.filter(c => c.route === 'editor');
+  assert.deepEqual(registrations[0].body, { socketPath: socket, workspaceFolders: ['/project'], explicit: false });
+  assert.equal(f.calls.filter(c => c.exe).length, 0);
+  socket = '/run/user/42/vscode-ipc-reloaded.sock';
+  await f.api.refreshBinding();
+  await f.api.show();
+  registrations = f.calls.filter(c => c.route === 'editor');
+  assert.equal(registrations[1].body.socketPath, socket);
+  assert.equal(registrations.at(-1).body.explicit, true);
+  assert.equal(f.calls.filter(c => c.exe).length, 1);
+});
+
+test('background registration is quiet without a unique bridge and never binds untrusted/other-language editors', async () => {
+  let picks = 0;
+  const f = fixture({ editorSocket: () => '/run/user/42/vscode-ipc-first.sock',
+    candidates: async () => ['/project/one.json', '/project/two.json'] });
+  f.vscode.window.showQuickPick = async () => { picks++; };
+  await f.api.refreshBinding();
+  assert.equal(picks, 0);
+  assert.equal(f.calls.filter(c => c.route === 'editor').length, 0);
+  f.calls.length = 0;
+  f.vscode.workspace.isTrusted = false;
+  await f.api.refreshBinding();
+  f.vscode.workspace.isTrusted = true; f.document.languageId = 'javascript';
+  await f.api.refreshBinding();
+  assert.equal(f.calls.length, 0);
+});
+
+test('metadata/focus listeners renew binding after bridge startup and stop on disposal', async () => {
+  const f = fixture({ editorSocket: () => '/run/user/42/vscode-ipc-first.sock' });
+  f.api.startBinding();
+  f.events.metadataCreate(); f.events.metadataChange(); f.events.active(); f.events.focus({ focused: true });
+  await new Promise(resolve => setTimeout(resolve, 260));
+  assert.equal(f.calls.filter(c => c.route === 'editor').length, 1, 'Events are debounced');
+  for (const subscription of f.context.subscriptions) subscription.dispose();
+  const count = f.calls.length;
+  await f.api.refreshBinding();
+  assert.equal(f.calls.length, count);
+});
+
+test('registration failure does not break forward search', async () => {
+  const f = fixture({ editorSocket: () => '/run/user/42/vscode-ipc-first.sock',
+    request: async (_meta, route) => {
+      if (route === 'editor') throw Error('Unknown bridge request');
+      return route === 'status' ? { forwardSearch: true, revision: 1, mappingReady: true } : f.target;
+    } });
+  await f.api.show();
+  assert.equal(f.calls.filter(c => c.exe).length, 1);
   assert.deepEqual(f.warnings, []);
 });
 

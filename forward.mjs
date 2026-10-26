@@ -55,6 +55,42 @@ export function parseJumpFrame(data) {
   return positions;
 }
 
+export function checkForwardRequest(response, deadline) {
+  if (response.destroyed) throw Error('Forward search cancelled');
+  if (Date.now() >= deadline) throw Error('Forward search request expired');
+}
+
+export async function refineForward(source, positions, { pageLookup, sourceCache, query, check }) {
+  // Typst 0.14.2 gives span anchors. Verify matching words through inverse lookup.
+  // The 32-probe cap is a latency choice, not a completeness claim.
+  let probes = 0;
+  for (const position of positions) {
+    const candidates = (pageLookup.get(position.page) || []).filter(word =>
+      source.word && normalWord(word.text) === source.word);
+    candidates.sort((a, b) =>
+      ((a.box[0] - position.x) ** 2 + (a.box[1] - position.y) ** 2) -
+      ((b.box[0] - position.x) ** 2 + (b.box[1] - position.y) ** 2));
+    for (const word of candidates) {
+      if (++probes > 32) break;
+      const [a, b, c, d] = word.box;
+      const x = (a + c) / 2, y = (b + d) / 2;
+      let mapped = sourceCache.get(word.id);
+      if (!mapped || mapped.approximate) mapped = await query({ page_no: position.page, x, y });
+      // Drain the untagged reply before observing cancellation. Releasing the
+      // serial queue sooner could give this reply to a newer click.
+      check();
+      if (!mapped) continue;
+      sourceCache.set(word.id, mapped);
+      if (mapped.filepath === source.filepath && mapped.line === source.line + 1 &&
+          mapped.column - 1 >= source.tokenStart && mapped.column - 1 < source.tokenEnd)
+        return { page: position.page, x, y, record: word.id, candidatePages: positions.length,
+          approximate: false, accuracy: 'word' };
+    }
+    if (probes > 32) break;
+  }
+  return forwardRecord(positions, pageLookup);
+}
+
 export function forwardRecord(positions, byPage) {
   // A macro may appear more than once. Use the first rendered occurrence with
   // text, and report the multiplicity rather than claiming a unique location.

@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
+import { once } from 'node:events';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { sourceHash, sourcePosition, readForwardSource, parseJumpFrame, forwardRecord, normalWord } from './forward.mjs';
+import { sourceHash, sourcePosition, readForwardSource, parseJumpFrame, forwardRecord, normalWord, refineForward, checkForwardRequest } from './forward.mjs';
 
 const scratch = fileURLToPath(new URL('./scratch/', import.meta.url));
 fs.mkdirSync(scratch, { recursive: true });
@@ -55,4 +57,58 @@ test('span fallback uses only the indicated pages and labels its approximation',
   assert.equal(result.accuracy, 'span');
   assert.equal(result.approximate, true);
   assert.throws(() => forwardRecord([{ page: 1, x: 23, y: 5 }], pages), /No PDF text/);
+});
+
+test('cancelled/expired forward requests are rejected before source work', () => {
+  assert.throws(() => checkForwardRequest({ destroyed: true }, Infinity), /cancelled/);
+  assert.throws(() => checkForwardRequest({ destroyed: false }, Date.now() - 1), /expired/);
+  checkForwardRequest({ destroyed: false }, Infinity);
+});
+
+test('HTTP cancellation drains the outstanding mapper reply, skips remaining probes and unblocks the next request', async t => {
+  const source = { filepath: '/project/a.typ', line: 0, word: 'needle', tokenStart: 0, tokenEnd: 6 };
+  const pageLookup = new Map([[1, Array.from({ length: 32 }, (_, i) => ({ id: i + 1, text: 'needle', box: [i * 10, 0, i * 10 + 8, 8] }))]]);
+  const sourceCache = new Map();
+  let release, started, firstResponse, queuedResponse, queuedStarted, accepted = 0, queries = 0, queue = Promise.resolve();
+  const entered = new Promise(resolve => { started = resolve; });
+  const queuedEntered = new Promise(resolve => { queuedStarted = resolve; });
+  const query = async () => {
+    if (++queries === 1) { started(); return new Promise(resolve => { release = resolve; }); }
+    assert.equal(sourceCache.size, 0, 'The cancelled reply must not populate the source cache');
+    return { filepath: source.filepath, line: 1, column: 2 };
+  };
+  const server = http.createServer(async (request, response) => {
+    request.resume(); firstResponse ||= response;
+    if (++accepted === 2) { queuedResponse = response; queuedStarted(); }
+    const check = () => checkForwardRequest(response, Infinity);
+    const result = queue.then(async () => {
+      check();
+      return refineForward(source, [{ page: 1, x: 0, y: 0 }], { pageLookup, sourceCache, query, check });
+    });
+    queue = result.catch(() => {});
+    try { const target = await result; response.end(JSON.stringify(target)); }
+    catch { if (!response.destroyed) { response.statusCode = 500; response.end(); } }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  const url = `http://127.0.0.1:${server.address().port}/forward`, controller = new AbortController();
+  const old = fetch(url, { method: 'POST', signal: controller.signal });
+  const cancelled = assert.rejects(old, /abort/i);
+  await entered;
+  const disconnected = once(firstResponse, 'close');
+  controller.abort(); await cancelled; await disconnected;
+  const queuedController = new AbortController();
+  const queued = fetch(url, { method: 'POST', signal: queuedController.signal });
+  const queuedCancelled = assert.rejects(queued, /abort/i);
+  await queuedEntered;
+  const queuedDisconnected = once(queuedResponse, 'close');
+  queuedController.abort(); await queuedCancelled; await queuedDisconnected;
+  const next = fetch(url, { method: 'POST' });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(queries, 1, 'Do not release the serial queue before draining the untagged reply');
+  release(null);
+  const response = await next;
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).record, 1);
+  assert.equal(queries, 2, 'Skip cancelled queued work: only the in-flight probe and the newest request reach the mapper');
 });

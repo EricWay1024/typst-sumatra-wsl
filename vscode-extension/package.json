@@ -2,7 +2,7 @@
   "name": "typst-sumatra-wsl",
   "displayName": "Typst / Sumatra: Ctrl+Click to PDF",
   "description": "Ctrl+click Typst source in WSL to jump to its PDF in Windows SumatraPDF.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "ericway1024",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],

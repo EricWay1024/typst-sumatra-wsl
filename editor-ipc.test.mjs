@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { editorSocket, editorOpenMessage, openInEditor } from './editor-ipc.mjs';
+import { editorSocket, editorOpenMessage, openInEditor, createEditorBinding } from './editor-ipc.mjs';
 
 const position = { filepath: '/home/test/space # percent % résumé.typ', line: 12, column: 4 };
 const stat = () => ({ uid: 42, isSocket: () => true });
@@ -27,6 +27,35 @@ test('an explicit window binding wins; a stale binding does not redirect to anot
   assert.equal(choose(row(b), { env: { VSCODE_IPC_HOOK_CLI: a }, stat: file => {
     if (file === a) throw Error('gone'); return stat();
   } }).reason, 'stale-editor-binding');
+});
+
+test('a project registration renews a dead binding, but automatic renewal cannot steal a live window', () => {
+  let table = row(b);
+  const binding = createEditorBinding('/project/main.typ', { env: { VSCODE_IPC_HOOK_CLI: a },
+    uid: 42, stat, realpath: p => p, sockets: () => table });
+  const request = { socketPath: b, workspaceFolders: ['/project'] };
+  assert.deepEqual(binding.register(request), { bound: true });
+  assert.deepEqual(binding.discover(), { socketPath: b });
+  table = [row(a), row(b)].join('\n');
+  assert.deepEqual(binding.register({ ...request, socketPath: a }), { bound: false, reason: 'another-live-window-bound' });
+  assert.equal(binding.discover().socketPath, b);
+  assert.deepEqual(binding.register({ ...request, socketPath: a, explicit: true }), { bound: true });
+  assert.equal(binding.discover().socketPath, a);
+  table = row(b);
+  assert.deepEqual(binding.register(request), { bound: true }, 'Reload can renew again without restarting the bridge');
+});
+
+test('registration rejects other projects, invalid socket types/owners and non-listeners', () => {
+  const options = { env: {}, uid: 42, stat, realpath: p => p, sockets: () => row(a) };
+  const request = { socketPath: a, workspaceFolders: ['/project'] };
+  const binding = createEditorBinding('/project/main.typ', options);
+  for (const workspaceFolders of [[], ['/project-other'], ['/project/main'], ['relative'], null])
+    assert.throws(() => binding.register({ ...request, workspaceFolders }));
+  for (const socketPath of [b, '/run/user/42/not-vscode.sock', null, 42])
+    assert.throws(() => binding.register({ ...request, socketPath }));
+  for (const overrides of [{ uid: 43 }, { stat: () => ({ uid: 42, isSocket: () => false }) }, { sockets: () => row(a, '00000000') }])
+    assert.throws(() => createEditorBinding('/project/main.typ', { ...options, ...overrides }).register(request));
+  assert.deepEqual(binding.register(request), { bound: true });
 });
 
 test('goto protocol preserves Unicode, spaces, URI metacharacters and one-based coordinates', () => {
