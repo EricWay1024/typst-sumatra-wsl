@@ -1,79 +1,139 @@
-# Typst ↔ SumatraPDF ↔ VS Code (WSL)
+# typst-sumatra-wsl
 
+### Your PDF has a return address.
+
+[![Built entirely by Codex](https://img.shields.io/badge/built_entirely_by-OpenAI_Codex-111827)](https://openai.com/codex/)
 [![Checks](https://github.com/EricWay1024/typst-sumatra-wsl/actions/workflows/check.yml/badge.svg)](https://github.com/EricWay1024/typst-sumatra-wsl/actions/workflows/check.yml)
 
-Double-click text in **SumatraPDF on Windows** to jump to its **Typst source in
-VS Code running through WSL**.
+**Double-click your PDF in SumatraPDF. Land in the Typst source in VS Code.**
+Windows on one side. WSL on the other. Your train of thought, ideally, still intact.
 
-This is an experimental inverse-search bridge, not native Typst SyncTeX support.
-It keeps the native Typst compiler responsible for the PDF and uses a separate,
-version-matched Tinymist process to resolve PDF coordinates to source positions.
-It does not change VS Code's Tinymist extension settings.
+> **This entire project was built by OpenAI Codex.**
+> The architecture, bridge, native Windows launcher, performance investigation,
+> fixes, tests, benchmarks, installer, CI, and this README. All Codex.
+> The human supplied the problem, the feedback, and the entirely reasonable
+> expectation that finding a line of text should not become a second research project.
 
-## How it works
+[Get started](#get-started) · [Show me the numbers](#numbers-with-a-denominator) · [Under the hood](#under-the-hood) · [Meet the team](#meet-the-entire-engineering-department)
+
+## We are disrupting “where did I write that?”
+
+You write Typst in VS Code through WSL. You read the PDF in SumatraPDF on Windows.
+You spot a typo. You would like to fix the typo, not conduct a cross-platform
+archaeological expedition.
+
+This bridge makes that double-click take you back to the source file, line and
+column. No extra VS Code extension. No hosted service. No account to create.
+
+**AI-built. Not AI-in-the-click-path.** Codex wrote the software; using it does
+not call a model or upload your document. The bridge resolves jumps locally.
+There is no token budget for correcting a comma.
+
+Our total addressable market is everyone who has ever lost their place in a PDF.
+Our supported addressable market is considerably more specific. We call this focus.
+
+## Fewer processes. More progress.
+
+The earlier click path looked like this:
 
 ```text
-SumatraPDF -> native C# launcher -> authenticated loopback HTTP -> source position
-                               -> running VS Code's local IPC -> editor
-                               -> VS Code CLI (fallback only)
+Sumatra → C# → PowerShell → wsl.exe → Bash → Node → HTTP → VS Code CLI
 ```
 
-- PDF word rectangles are extracted with `pdftotext` and published as a
-  coordinate-based SyncTeX file that Sumatra can read.
-- The native launcher requests the already-running WSL service directly. The
-  service hands the position to the running editor using VS Code's remote-CLI
-  IPC protocol. The fast path starts neither `Code.exe` nor PowerShell, `wsl.exe`,
-  Bash or Node. No additional editor extension is installed.
-- An explicit `VSCODE_IPC_HOOK_CLI` inherited from a VS Code terminal selects that
-  window. Otherwise, the service uses a unique active, same-user CLI socket.
-  Missing, ambiguous or unresponsive sockets fall back to the existing VS Code
-  CLI. Stale explicit bindings are never silently redirected to another window.
-- The Windows helper passes foreground permission to the running Code process
-  before requesting a jump, so IPC does not depend on launching another Code
-  process to bring the editor forward.
-- After PDF compilation, the source mapper is prewarmed in the background. It is
-  paused after 800 ms of inactivity. A cached lookup does not wake it.
-- Nearby-word fallback uses a page-local index and a bounded top-eight selection.
-  Negative mapper replies are recognised immediately, rather than wasting the
-  three-second query timeout before failing to try nearby text.
-- PDF updates invalidate cached source locations. Results interrupted by an update
-  are rejected rather than returned with stale line numbers.
-- A stopped bridge can be restarted through `wsl.exe`; the recovery path finds
-  the helper under the default WSL user's `$HOME/bin`.
+A remarkable amount of onboarding for one cursor movement.
 
-**Prewarming is not incremental mapper reuse.** The separate mapper is still
-restarted when the native compiler rebuilds, so it cannot silently query an old
-compiled document. Clicking immediately after saving can still require waiting.
-Generated text or whitespace may resolve approximately to nearby source text.
+The fast path now talks to things that are already running:
 
-## Requirements
+```text
+Sumatra → native C# launcher → local bridge → running VS Code window
+                                  │
+                                  └─ resolve PDF position to Typst source
+```
 
-The currently tested compiler pair is:
+- **Direct delivery.** Authenticated loopback HTTP, then VS Code's existing local
+  IPC. No fresh `Code.exe`, PowerShell, `wsl.exe`, Bash or Node process on the fast path.
+- **Warm before you click.** After PDF compilation, the source mapper prepares in
+  the background. Cached lookups leave the idle mapper asleep.
+- **An actual fallback.** If editor IPC is unavailable or the target window is
+  ambiguous, the normal VS Code CLI takes over. A stopped bridge can recover
+  through WSL. We prefer a slower jump to an impressively fast nothing.
+- **Your workflow stays yours.** Native Typst still makes the PDF. Sumatra still
+  displays it. VS Code's Tinymist extension settings are left alone.
 
-| Component | Version / location |
+**Status: experimental.** This is a SyncTeX adapter, not native Typst SyncTeX
+support. The marketing department is optimistic; the compatibility matrix is specific.
+
+## Numbers with a denominator
+
+On one Windows/WSL machine, **five alternating runs per launcher**, resolving the
+same cached source record:
+
+| Click preparation + source lookup | Median | Range |
+| --- | ---: | ---: |
+| Earlier PowerShell → WSL → Node chain | 2,800 ms | 2,289–2,985 ms |
+| Native C# → HTTP client | 350 ms | 337–406 ms |
+
+**About 8× faster for that measured stage.** Not “8× faster at everything.”
+We have resisted the pitch-deck temptation to remove this sentence.
+
+Both launchers were started by a Windows parent from the same WSL directory.
+`-PrintCommand` excluded the final VS Code CLI launch and editor update. These
+measurements also **predate the direct editor-IPC path**: they do not quantify its
+additional saving. Reproduce this comparison with [`windows/benchmark.ps1`](windows/benchmark.ps1).
+
+Codex also found a less glamorous bottleneck: a mismatched log-message name made
+negative source lookups wait **three seconds**, then discard the warmed mapper,
+instead of trying nearby text. That is fixed and covered by a real-compiler
+regression test. Sometimes the breakthrough is reading what the program actually said.
+
+Cold compilation, recent saves and resource pressure can still cause delays.
+We are optimising a jump, not repealing causality.
+
+## Meet the entire engineering department
+
+**Codex. That's the engineering department.**
+
+This is not “AI-assisted” in the sense of accepting an autocomplete suggestion.
+Codex built the complete bridge project end to end, under human direction:
+
+| Department | Team |
+| --- | --- |
+| Architecture and implementation | Codex |
+| Windows argument quoting and other character-building experiences | Codex |
+| Profiling, optimisation and debugging | Codex |
+| Tests, benchmarks, packaging and CI | Codex |
+| Documentation and this slightly overfunded-sounding README | Also Codex |
+| Product direction and “can it be faster?” | The human |
+
+Including the bugs. Including the fixes. Full-stack ownership.
+
+This is an independent project, not an official OpenAI product. And Codex did
+**not** invent Typst, Tinymist, SumatraPDF, VS Code, Node.js or Poppler. This bridge
+stands on their work; the attribution above is to the bridge project itself.
+
+## Get started
+
+### 0. The stack. Yes, the versions matter.
+
+| Component | Tested version / requirement |
 | --- | --- |
 | Native Typst | **0.14.2**, at `~/.cargo/bin/typst` |
 | Standalone Tinymist mapper | **0.14.20**, embedding Typst 0.14.2 |
-| Node.js | Built-in `WebSocket` support; Node 22+ |
+| Node.js in WSL | **22+**, with built-in `WebSocket` support |
 | Linux tools | Bash, Python 3, `pdftotext` from `poppler-utils` |
-| Windows tools | SumatraPDF, VS Code with Remote - WSL, .NET Framework C# compiler |
+| Windows | SumatraPDF, VS Code with Remote - WSL, .NET Framework C# compiler |
 
-The mapper is independent of the VS Code Tinymist extension; the extension can
-have a different version. Do not substitute arbitrary mapper/compiler versions:
-their layout and source-position protocol must agree.
+The standalone mapper is separate from the VS Code Tinymist extension; the
+extension can have a different version. **Do not swap arbitrary compiler/mapper
+versions.** Their layout and source-position protocol must agree.
 
-The fallback launcher defaults to a **per-user VS Code installation** at
-`%LOCALAPPDATA%\Programs\Microsoft VS Code`. For a different installation, set the
-Windows environment variable `TYPST_SUMATRA_CODE_ROOT` to the directory containing
-`Code.exe` and `bin/code.cmd`. The build helper assumes Windows is
-mounted at `/mnt/c`. WSL localhost forwarding must be available for the fast path.
-The tested PDF viewer was SumatraPDF 3.5.x.
+The tested viewer was SumatraPDF 3.5.x. The build helper assumes Windows is mounted
+at `/mnt/c`; WSL localhost forwarding must work for the fast path. Third-party
+binaries and document contents are not bundled.
 
-Third-party binaries and document contents are not included in this repository.
+### 1. Install the Linux side
 
-## Install
-
-### 1. Linux helper, inside WSL
+Inside WSL:
 
 ```bash
 git clone https://github.com/EricWay1024/typst-sumatra-wsl.git
@@ -81,26 +141,25 @@ cd typst-sumatra-wsl
 bash install.sh
 ```
 
-This installs `~/bin/typst-sumatra` and copies four library files into
-`~/.local/lib/typst-sumatra/`. It leaves the mapper binary and existing watchers
-alone. Add `~/bin` to your `PATH`, or use the full helper path as below.
+This installs `~/bin/typst-sumatra` and copies four library files to
+`~/.local/lib/typst-sumatra/`. It does not replace the mapper binary or restart
+existing watchers. Add `~/bin` to your `PATH`, or use the full path below.
 
 Install [Typst 0.14.2](https://github.com/typst/typst/releases/tag/v0.14.2) at
-`~/.cargo/bin/typst`. Install the matching Linux binary from
-[Tinymist v0.14.20](https://github.com/Myriad-Dreamin/tinymist/releases/tag/v0.14.20)
-at:
+`~/.cargo/bin/typst`, and the matching Linux binary from
+[Tinymist v0.14.20](https://github.com/Myriad-Dreamin/tinymist/releases/tag/v0.14.20) at:
 
 ```text
 ~/.local/lib/typst-sumatra/bin/tinymist-0.14.20
 ```
 
-Choose the appropriate Linux architecture, verify the upstream checksum and make
-the binary executable. Both `typst --version` and the mapper's `--version` output
-should identify Typst 0.14.2. Install `poppler-utils` if `pdftotext` is missing.
+Choose the correct Linux architecture, verify the upstream checksum and make the
+binary executable. Both binaries' `--version` output should identify Typst 0.14.2.
+Install `poppler-utils` if `pdftotext` is missing.
 
-### 2. Windows inverse-search launcher
+### 2. Install the Windows side
 
-Still in the cloned repository, build into persistent scratch:
+Still in the cloned repository:
 
 ```bash
 mkdir -p scratch
@@ -110,21 +169,23 @@ python3 -B test-windows.py "$TYPST_SUMATRA_SCRATCH/open-in-vscode.exe"
 ```
 
 Copy `scratch/open-in-vscode.exe` to a persistent Windows location, for example
-`%LOCALAPPDATA%\SumatraPDF\open-in-vscode.exe`. If upgrading, keep a backup of the
-previous executable first.
+`%LOCALAPPDATA%\SumatraPDF\open-in-vscode.exe`. Back up the old executable when upgrading.
 
-In SumatraPDF's **Settings → Advanced Options**, set these entries, replacing
-`<WindowsUser>` with the actual Windows account name:
+In SumatraPDF's **Settings → Advanced Options**, add these entries, replacing
+`<WindowsUser>` with your Windows account name:
 
 ```text
 EnableTeXEnhancements = true
 InverseSearchCmdLine = "C:\Users\<WindowsUser>\AppData\Local\SumatraPDF\open-in-vscode.exe" "%f" %l %c
 ```
 
-The native launcher discovers VS Code's versioned CLI location from its installed
-`code.cmd`; no VS Code version hash is hardcoded.
+The fallback launcher defaults to VS Code at
+`%LOCALAPPDATA%\Programs\Microsoft VS Code`. For a different installation, set the
+Windows environment variable `TYPST_SUMATRA_CODE_ROOT` to the directory containing
+`Code.exe` and `bin/code.cmd`. The launcher discovers the versioned CLI entry point
+from `code.cmd`; no VS Code version hash is hardcoded.
 
-## Use
+### 3. Achieve product–cursor fit
 
 Inside your document project:
 
@@ -135,19 +196,14 @@ mkdir -p scratch
 ```
 
 Open `main.pdf` in Windows SumatraPDF. `wslpath -w main.pdf` gives its Windows UNC
-path. Double-click text in the PDF to jump to the source in VS Code.
+path. **Double-click text. Go back to writing.** That is the entire product demo.
 
-Do not run another `typst watch` writing the same PDF. The bridge already owns a
-native watcher. To start a detached watcher instead:
+The bridge owns the native PDF watcher. **Do not run another `typst watch` writing
+the same PDF.** For a detached watcher, use this instead:
 
 ```bash
 ~/bin/typst-sumatra ensure --root . main.typ main.pdf
 ```
-
-Scratch selection is: `TYPST_SUMATRA_SCRATCH`, an existing `.r2scratch` beside the
-PDF, or an existing `scratch` under the project root. If none exists, the helper
-asks for an explicit directory. It never uses the OS temporary directory.
-Generated logs and mapper snapshots stay in `SCRATCH/typst-sumatra/`.
 
 Ignore generated files in your document repository:
 
@@ -159,68 +215,103 @@ Ignore generated files in your document repository:
 *.typst-sync.json
 ```
 
-The hidden metadata file next to the PDF contains a local capability token. Do
-not publish it. The HTTP bridge binds only to `127.0.0.1`; do not expose it to a
-network or remove its authentication.
+## The fine print, in normal-sized type
 
-## Diagnostics and tests
+- **Not every PDF glyph has an exact source span.** Generated text and whitespace
+  may resolve approximately to nearby source text.
+- **Prewarming is not incremental mapper reuse.** Native recompilation still
+  restarts the mapper and invalidates cached source positions. Clicking right
+  after a save can require waiting; a lookup interrupted by an update is rejected
+  rather than returning stale line numbers.
+- **Window selection is deliberate.** A watcher started inside the intended
+  VS Code terminal can inherit `VSCODE_IPC_HOOK_CLI`. Otherwise, the bridge uses a
+  unique active, same-user CLI socket. Missing, ambiguous or unresponsive sockets
+  fall back to the CLI. A stale explicit binding is not redirected to another window.
+- **Keep the capability token private.** The hidden `.typst-sync.json` metadata
+  beside the PDF contains it. Do not publish that file, expose the loopback HTTP
+  service to a network, or remove authentication. “Local-first” is not permission
+  to bind to `0.0.0.0` and hope.
+- **Scratch is persistent.** The helper uses `TYPST_SUMATRA_SCRATCH`, an existing
+  `.r2scratch` beside the PDF, or an existing `scratch` under the project root, in
+  that order. If none exists, it asks for an explicit directory. Logs and mapper
+  snapshots live in `SCRATCH/typst-sumatra/`, never the OS temporary directory.
 
-The authenticated `/status` endpoint reports map readiness, mapper state, revision,
-warmup timing and cache hits. `editor.lastRequest` reports `vscode-ipc` or
-`cli-fallback`, the handoff time and any fallback reason. IPC acknowledgement
-means the request was forwarded, **not** that the GUI has finished updating.
-The native launcher provides two non-GUI modes:
+## Under the hood
 
-- `--resolve-only`: output the source file, line and column as UTF-8 JSON.
-- `-PrintCommand`: output the VS Code command without opening the editor.
+<details>
+<summary><strong>The architecture slide, without the gradient</strong></summary>
+
+1. Native Typst compiles the PDF. `pdftotext` extracts word rectangles, which the
+   bridge publishes as a coordinate-based SyncTeX file Sumatra can read.
+2. After compilation, a separate, version-matched Tinymist process prewarms source
+   lookup. It pauses after 800 ms of inactivity; a cache hit does not wake it.
+3. Sumatra launches the native C# helper with the selected record. The helper reads
+   metadata over the WSL UNC share and sends an authenticated loopback HTTP request.
+4. The bridge resolves the source position. Nearby-text fallback uses a page-local
+   index and a bounded top-eight selection. Negative replies are recognised
+   immediately instead of waiting for the query timeout.
+5. The bridge sends a goto request to the running editor's local IPC socket.
+   The Windows helper first passes foreground permission to the running Code
+   process. If IPC cannot be used, the helper invokes the ordinary VS Code CLI.
+6. If the bridge itself has stopped, the helper can recover it through `wsl.exe`,
+   finding the Linux helper under the default WSL user's `$HOME/bin`.
+
+The IPC format was checked against VS Code 1.143.1's
+[`server.cli.ts`](https://github.com/microsoft/vscode/blob/e646868227c3e3a9e3f24277c8c7220be42c0be7/src/vs/server/node/server.cli.ts)
+and [`extHostCLIServer.ts`](https://github.com/microsoft/vscode/blob/e646868227c3e3a9e3f24277c8c7220be42c0be7/src/vs/workbench/api/node/extHostCLIServer.ts).
+It is an internal protocol, not a promised public API. Hence the fallback.
+
+For the three-second bug: Tinymist 0.14.20 logs frame-location results as
+`resolved WebviewResolveSpan: None`, not `resolved WebviewResolveFrameLoc: None`.
+The previous matcher missed the negative reply. The regression test clicks an
+empty margin, resolves nearby text and verifies the same warmed mapper survives.
+
+</details>
+
+<details>
+<summary><strong>Due diligence: diagnostics and tests</strong></summary>
+
+The authenticated `/status` endpoint reports map readiness, mapper state,
+revision, warmup timing and cache hits. `editor.lastRequest` records `vscode-ipc`
+or `cli-fallback`, handoff time and any fallback reason. **IPC acknowledgement
+means the request was forwarded, not that the GUI has finished updating.**
+
+Two native-launcher flags inspect the click path without opening the editor:
+
+- `--resolve-only`: source file, line and column as UTF-8 JSON.
+- `-PrintCommand`: the VS Code command that would be used.
+
+From the cloned repository:
 
 ```bash
 node --test test.mjs editor-ipc.test.mjs
+mkdir -p scratch
 export TYPST_SUMATRA_SCRATCH="$PWD/scratch"
 node integration-test.mjs
 python3 -B test-windows.py "$TYPST_SUMATRA_SCRATCH/open-in-vscode.exe"
 ```
 
 The integration test uses a tiny standalone document, real compilers and isolated
-persistent scratch. It checks prewarming, cache hits, authentication, line shifts,
-rapid saves, negative source replies, editor IPC and fallback. Set
-`TYPST_SUMATRA_CLIENT` to the Linux path of the built Windows launcher to also test
-Windows → real bridge → mock editor and recovery of a stopped bridge; recovery
-requires the Linux helper to be installed. Tests do not open VS Code or edit your
-document. The Windows tests use a sentinel CLI so a failed fast-path test cannot
-accidentally open the real editor. Unix-socket fixtures use the repository's
-`scratch/` directory to stay within the Unix socket pathname-length limit.
+persistent scratch. It covers prewarming, cache hits, authentication, line shifts,
+rapid saves, negative source replies, editor IPC and fallback.
+
+Set `TYPST_SUMATRA_CLIENT` to the Linux path of the built Windows launcher to also
+check Windows → real bridge → mock editor and stopped-bridge recovery. Recovery
+requires the Linux helper to be installed.
+
+Tests do not open VS Code or edit your document. Windows tests use a sentinel CLI
+so a broken fast path cannot accidentally open the real editor. Unix-socket
+fixtures live in the repository's `scratch/` directory to stay within the socket
+pathname-length limit.
 
 CI runs dependency-free JavaScript tests and syntax checks, and compiles the C#
-launcher on Windows. The actual WSL/Sumatra interaction requires the local tests.
+launcher on Windows. Actual WSL/Sumatra interaction requires the local tests.
+AI authorship is not a substitute for those checks. Codex wrote those too.
 
-## Performance measurement
+</details>
 
-On one Windows/WSL machine, five alternating runs per launcher against the same
-cached source record gave:
+---
 
-| Click preparation and source lookup | Median | Range |
-| --- | ---: | ---: |
-| Previous PowerShell → WSL → Node launch chain | 2800 ms | 2289–2985 ms |
-| Native C# → HTTP client | 350 ms | 337–406 ms |
+**Built entirely by Codex. Built for one very specific double-click.**
 
-This is about eight times faster **for the measured part of the path**, not an
-end-to-end GUI latency claim. Both launchers were started by a Windows parent
-from the same WSL directory; `-PrintCommand` excluded the final VS Code CLI launch
-and editor selection update. These figures predate the direct editor-IPC path;
-they do not measure its additional saving. `windows/benchmark.ps1` can compare
-two builds in that way. Document compilation, prewarming and system resource
-pressure can still cause delays, especially immediately after edits.
-
-The IPC wire format was checked against VS Code 1.143.1's
-[`server.cli.ts`](https://github.com/microsoft/vscode/blob/e646868227c3e3a9e3f24277c8c7220be42c0be7/src/vs/server/node/server.cli.ts)
-and [`extHostCLIServer.ts`](https://github.com/microsoft/vscode/blob/e646868227c3e3a9e3f24277c8c7220be42c0be7/src/vs/workbench/api/node/extHostCLIServer.ts).
-It is an internal protocol; the ordinary CLI remains the compatibility fallback.
-
-A separate latency bug concerned negative mapper results: Tinymist 0.14.20 logs
-frame-location results as `resolved WebviewResolveSpan: None`, not
-`resolved WebviewResolveFrameLoc: None`. The previous matcher missed that reply,
-waited three seconds and discarded the warmed mapper. The corrected matcher is
-covered by a real-compiler test that clicks an empty margin, resolves nearby text
-and verifies that the same mapper process survives. This approximate fallback is
-not a claim that generated PDF text has an exact source span.
+Our exit strategy is `--goto`.
