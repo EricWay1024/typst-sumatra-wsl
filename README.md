@@ -265,6 +265,12 @@ instead; this extension does not change that global setting. Set
 - **Saved sources only.** Forward search checks a content hash and PDF revision,
   refuses unsaved/stale clicks and cancels superseded requests. Hovering a PDF
   link never opens the viewer. The extension requires a trusted WSL workspace.
+- **Compilation errors fail promptly.** A failed native build keeps the last
+  good PDF but disables both jump directions until a successful save. Queued
+  lookups also stop waiting when compilation fails; they do not repeatedly start
+  the mapper. `/status` exposes `compileState` and `compileError` separately from
+  `ready` (which only means a PDF exists). With no previous PDF, `ensure` reports
+  the compile failure instead of waiting for its startup timeout.
 - **Prewarming is not incremental mapper reuse.** Native recompilation still
   restarts the mapper and invalidates cached source positions. Clicking right
   after a save can require waiting; a lookup interrupted by an update is rejected
@@ -287,6 +293,27 @@ instead; this extension does not change that global setting. Set
   `.r2scratch` beside the PDF, or an existing `scratch` under the project root, in
   that order. If none exists, it asks for an explicit directory. Logs and mapper
   snapshots live in `SCRATCH/typst-sumatra/`, never the OS temporary directory.
+
+### Large documents: keep editing independent of compilation
+
+The bridge does not intercept ordinary typing or Enter. However, VS Code's
+Tinymist language server can compile the entire document on edits even with
+`tinymist.exportPdf: "never"`. If that stalls or exhausts memory, use these
+**workspace** settings and run **Developer: Reload Window** once:
+
+```json
+{
+  "tinymist.exportPdf": "never",
+  "tinymist.syntaxOnly": "enable",
+  "tinymist.onEnterEvent": false
+}
+```
+
+This keeps highlighting/basic completion and avoids a language-server round trip
+on Enter. It deliberately removes full semantic editor analysis: consult the
+**Typst Watch terminal** for full compilation errors, not just the Problems panel.
+Native PDF compilation and the separate version-matched Sumatra mapper continue
+unchanged. Set `syntaxOnly` to `"disable"` and reload to restore full analysis.
 
 ## Under the hood
 
@@ -362,13 +389,17 @@ mkdir -p scratch
 export TYPST_SUMATRA_SCRATCH="$PWD/scratch"
 node integration-test.mjs
 node forward-integration-test.mjs  # Also requires the synctex command-line tool.
+node syntax-error-integration-test.mjs
 python3 -B test-windows.py "$TYPST_SUMATRA_SCRATCH/open-in-vscode.exe"
 python3 -B test-forward-windows.py
 ```
 
 The integration test uses a tiny standalone document, real compilers and isolated
 persistent scratch. It covers prewarming, cache hits, authentication, line shifts,
-rapid saves, negative source replies, editor IPC and fallback. Forward-search tests
+rapid saves, negative source replies, editor IPC and fallback. The syntax-error
+regression covers an invalid initial document, prompt failures in both directions,
+queued/burst clicks, last-good-PDF preservation and repair without restarting.
+Forward-search tests
 cover imported sources, supplementary Unicode characters, actual SyncTeX forward
 queries, cache invalidation after saving, and timeout recovery. Extension tests
 cover Typst-only registration, hover safety, unsaved/stale buffers and rapid clicks;

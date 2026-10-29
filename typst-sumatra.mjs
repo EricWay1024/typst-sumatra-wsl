@@ -153,6 +153,7 @@ async function ensure(config) {
   for (let attempt = 0; attempt < 160; attempt++) {
     active = await existing(config.pdf);
     if (active?.status.ready) return active.metadata;
+    if (active?.status.compileError) throw Error(active.status.compileError);
     await pause(250);
   }
   throw Error(`The Typst bridge did not finish compiling. Check ${cacheDirectory(config)}/*.log.`);
@@ -169,6 +170,7 @@ async function watch(config) {
   const editorBinding = createEditorBinding(input);
   const workspace = fs.mkdtempSync(path.join(cacheDirectory(config), 'session-'));
   let revision = 0, building = false, dirty = false, timer;
+  let compileState = 'starting', compileError = null;
   let ready = fs.existsSync(pdf) && fs.statSync(pdf).size > 0, points = [], lastResolved = null;
   let mappingReady = false, snapshot = null, activeSnapshot = null, mapWorker = null;
   let mapperPromise = null, mapperReady = false, mapperPaused = false, idleTimer, warmupTimer, native;
@@ -189,7 +191,7 @@ async function watch(config) {
     };
     if (request.headers.authorization !== `Bearer ${token}`) return reply(403, { error: 'Invalid bridge token' });
     if (request.method === 'GET' && request.url === '/status') return reply(200, {
-      ready, mappingReady, input, pdf, lastResolved, timings, mapperRunning: !!child, mapperPaused,
+      ready, mappingReady, compileState, compileError, input, pdf, lastResolved, timings, mapperRunning: !!child, mapperPaused,
       mapperReady, mapperPid: child?.pid ?? null, revision, cachedPositions: sourceCache.size,
       editor: { ...editorBinding.discover(), lastRequest: lastEditor },
       editorRegistration: true, forwardSearch: true, lastForward,
@@ -209,12 +211,17 @@ async function watch(config) {
       }
       const payload = JSON.parse(body);
       if (request.url === '/editor') return reply(200, editorBinding.register(payload));
+      checkCompilation();
       if (request.url === '/forward') return reply(200, await resolveForward(payload, response));
       const { id, open: openEditor } = payload;
       if (!Number.isInteger(id) || id < 1 || id > 2147483647) throw Error('Invalid PDF source position');
       const started = Date.now(), deadline = started + 20000;
       const result = queue.then(async () => {
-        while (!mappingReady && Date.now() < deadline && !response.destroyed) await pause(40);
+        while (!mappingReady && Date.now() < deadline && !response.destroyed) {
+          checkCompilation();
+          await pause(40);
+        }
+        checkCompilation();
         if (response.destroyed || Date.now() >= deadline) throw Error('Source lookup request expired');
         if (!ready || !mappingReady) throw Error('The PDF is updated; source mapping is still catching up.');
         const version = revision;
@@ -244,19 +251,29 @@ async function watch(config) {
   metadata.port = server.address().port;
   writeAtomic(metadataFile, JSON.stringify(metadata));
 
+  function checkCompilation() {
+    if (compileError) throw Error(compileError);
+  }
+
   async function resolveForward(payload, response) {
     const started = Date.now(), deadline = started + 20000;
     const result = queue.then(async () => {
+      checkCompilation();
       checkForwardRequest(response, deadline);
       const source = readForwardSource(root, payload);
       // A saved buffer can arrive before the native watcher's change event.
       // Do not use a PDF whose publication predates that save.
       while ((!mappingReady || Date.parse(timings.pdfUpdatedAt) < source.modifiedAt) &&
-          Date.now() < deadline && !response.destroyed) await pause(40);
+          Date.now() < deadline && !response.destroyed) {
+        checkCompilation();
+        await pause(40);
+      }
+      checkCompilation();
       checkForwardRequest(response, deadline);
       const version = revision;
       const key = JSON.stringify([source.filepath, source.line, source.character, source.hash]);
       const check = () => {
+        checkCompilation();
         checkForwardRequest(response, deadline);
         if (version !== revision || !mappingReady)
           throw Error('The PDF changed during forward search; click again');
@@ -294,7 +311,7 @@ async function watch(config) {
   }
 
   async function build() {
-    if (building || !dirty) return;
+    if (building || !dirty || compileState !== 'success') return;
     building = true; dirty = false;
     const version = revision;
     activeSnapshot = snapshot;
@@ -405,7 +422,7 @@ async function watch(config) {
     const version = revision;
     // Debounce edits: do not put a second compiler on the PDF publication path.
     warmupTimer = setTimeout(async () => {
-      if (shuttingDown || version !== revision) return;
+      if (shuttingDown || version !== revision || compileState !== 'success') return;
       const started = Date.now();
       try {
         await ensureMapper();
@@ -426,12 +443,18 @@ async function watch(config) {
   }
 
   async function ensureMapper() {
+    checkCompilation();
     clearTimeout(idleTimer);
     if (child && mapperPaused) { child.kill('SIGCONT'); mapperPaused = false; }
     if (mapperReady && dataSocket?.readyState === WebSocket.OPEN) return;
     if (mapperPromise) return mapperPromise;
     if (child) stopMapper();
-    let instance;
+    let instance, mapperError = null;
+    const failCompilation = () => {
+      mapperReady = false;
+      mapperError = Error('Typst source mapper compilation failed; fix the errors and save before jumping.');
+      pending?.fail(mapperError);
+    };
     const starting = (async () => {
       controlPort = null; dataPort = null; errorLog = ''; logBuffer = '';
       instance = child = spawn('nice', ['-n', '19', tinymist,
@@ -454,6 +477,7 @@ async function watch(config) {
           // and prevents the nearby-text fallback from ever being attempted.
           if (pending?.direction === 'inverse' && /resolved WebviewResolve(?:Span|FrameLoc): None/.test(line)) pending(null);
           if (line.includes('compilation succeeded')) mapperReady = true;
+          if (line.includes('compilation failed')) failCompilation();
         }
       });
       instance.on('error', error => {
@@ -465,8 +489,10 @@ async function watch(config) {
       });
       for (let attempt = 0; attempt < 200 && (!controlPort || !dataPort); attempt++) {
         if (child !== instance) throw Error('Source lookup was superseded by a PDF update');
+        if (mapperError) throw mapperError;
         await pause(50);
       }
+      if (mapperError) throw mapperError;
       if (!controlPort || !dataPort) throw Error('Tinymist source mapper did not start: ' + errorLog);
       const socket = port => new WebSocket(`ws://127.0.0.1:${port}`, { headers: { Origin: `http://127.0.0.1:${port}` } });
       control = socket(controlPort);
@@ -494,6 +520,7 @@ async function watch(config) {
         } else if (message.event === 'compileStatus') {
           if (message.kind === 'Compiling') mapperReady = false;
           if (message.kind === 'CompileSuccess') mapperReady = true;
+          if (message.kind === 'CompileError') failCompilation();
         }
       });
       await Promise.all([control, dataSocket].map(ws => new Promise((resolve, reject) => {
@@ -502,8 +529,10 @@ async function watch(config) {
       })));
       for (let attempt = 0; attempt < 200 && !mapperReady; attempt++) {
         if (child !== instance) throw Error('Source lookup was superseded by a PDF update');
+        if (mapperError) throw mapperError;
         await pause(50);
       }
+      if (mapperError) throw mapperError;
       if (!mapperReady) throw Error('Typst source lookup compilation failed: ' + errorLog);
       await pause(20);
     })();
@@ -529,11 +558,21 @@ async function watch(config) {
     let newline;
     while ((newline = nativeBuffer.indexOf('\n')) !== -1) {
       const line = nativeBuffer.slice(0, newline); nativeBuffer = nativeBuffer.slice(newline + 1);
-      if (line.includes('compiling ...')) {
+      // Only compiler status lines count: a diagnostic can quote arbitrary source.
+      if (/^\[\d{2}:\d{2}:\d{2}\] compiling \.\.\./.test(line)) {
+        compileState = 'compiling'; compileError = null;
         revision++; nativeStarted = Date.now(); mappingReady = false;
         dirty = false; clearTimeout(timer); clearTimeout(warmupTimer);
         stopMappingWorker(); stopMapper(); sourceCache.clear(); forwardCache.clear();
-      } else if (line.includes('compiled successfully')) {
+      } else if (/^\[\d{2}:\d{2}:\d{2}\] compiled with errors\b/.test(line)) {
+        compileState = 'error';
+        compileError = 'Typst compilation failed; fix the errors in the Typst Watch terminal and save before jumping.';
+        // Keep the last good PDF, but never wait for or query a stale source map.
+        mappingReady = false; dirty = false;
+        clearTimeout(timer); clearTimeout(warmupTimer);
+        stopMappingWorker(); stopMapper();
+      } else if (/^\[\d{2}:\d{2}:\d{2}\] compiled successfully\b/.test(line)) {
+        compileState = 'success'; compileError = null;
         // typst watch has already closed and published the PDF at this point.
         // This handler schedules mapping only; it never compiles or writes PDFs.
         ready = true;
