@@ -15,6 +15,29 @@ import { readForwardSource, parseJumpFrame, refineForward, checkForwardRequest }
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+// A cold full-document mapper can take longer than one interactive request.
+const mapperStartupMs = 90000;
+const mapperPreparingMessage = 'Source mapper is still preparing this PDF in the background; try again shortly.';
+
+export async function waitForMapper(starting, { deadline, cancelled = () => false,
+  check = () => {}, timeoutMessage = mapperPreparingMessage }) {
+  let outcome;
+  // Observe rejection even if this caller times out or disconnects first.
+  starting.then(value => { outcome = { value }; }, error => { outcome = { error, failed: true }; });
+  await Promise.resolve();
+  while (!outcome) {
+    check();
+    if (cancelled()) throw Error('Source lookup cancelled');
+    if (Date.now() >= deadline) throw Error(timeoutMessage);
+    await pause(40);
+  }
+  if (outcome.failed) throw outcome.error;
+  check();
+  if (cancelled()) throw Error('Source lookup cancelled');
+  if (Date.now() >= deadline) throw Error(timeoutMessage);
+  return outcome.value;
+}
+
 const metaPath = pdf => path.join(path.dirname(pdf), `.${path.basename(pdf, '.pdf')}.typst-sync.json`);
 const readJson = file => JSON.parse(fs.readFileSync(file, 'utf8'));
 const writeAtomic = (file, data) => {
@@ -179,7 +202,7 @@ async function watch(config) {
   const forwardCache = new Map();
   let lastForward = null;
   let queue = Promise.resolve(), pending = null, child;
-  let control, dataSocket, controlPort, dataPort, errorLog = '', logBuffer = '';
+  let control, dataSocket, controlPort, dataPort, logBuffer = '';
   const token = crypto.randomBytes(24).toString('hex');
   const metadata = { version: 4, ...config, token, port: 0, pid: process.pid };
 
@@ -229,7 +252,7 @@ async function watch(config) {
         if (cached) { timings.lastResolveCacheHit = true; return cached; }
         timings.lastResolveCacheHit = false;
         try {
-          await ensureMapper();
+          await mapperForLookup(response, deadline);
           if (version !== revision || !mappingReady) throw Error('The PDF changed during source lookup; click again.');
           const resolved = await resolveWord(id);
           if (version !== revision || !mappingReady) throw Error('The PDF changed during source lookup; click again.');
@@ -253,6 +276,12 @@ async function watch(config) {
 
   function checkCompilation() {
     if (compileError) throw Error(compileError);
+  }
+
+  function mapperForLookup(response, deadline) {
+    return waitForMapper(ensureMapper(), {
+      deadline, cancelled: () => response.destroyed, check: checkCompilation,
+    });
   }
 
   async function resolveForward(payload, response) {
@@ -283,7 +312,7 @@ async function watch(config) {
       if (forwardCache.has(key)) { timings.lastForwardCacheHit = true; return forwardCache.get(key); }
       timings.lastForwardCacheHit = false;
       try {
-        await ensureMapper();
+        await mapperForLookup(response, deadline);
         check();
         const positions = await query({ filepath: source.filepath, line: source.line,
           character: source.character }, 'forward');
@@ -438,7 +467,10 @@ async function watch(config) {
   function scheduleMapperPause() {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      if (child && !pending) { child.kill('SIGSTOP'); mapperPaused = true; }
+      // A cancelled/expired click must not freeze a shared, unfinished warmup.
+      if (child && mapperReady && !mapperPromise && !pending) {
+        child.kill('SIGSTOP'); mapperPaused = true;
+      }
     }, 800);
   }
 
@@ -450,13 +482,20 @@ async function watch(config) {
     if (mapperPromise) return mapperPromise;
     if (child) stopMapper();
     let instance, mapperError = null;
+    const startupDeadline = Date.now() + mapperStartupMs;
+    const startupTimeout = 'Source mapper preparation timed out after 90 seconds; save or restart Typst Watch to retry.';
+    const checkStartup = () => {
+      if (child !== instance) throw Error('Source lookup was superseded by a PDF update');
+      if (mapperError) throw mapperError;
+      if (Date.now() >= startupDeadline) throw Error(startupTimeout);
+    };
     const failCompilation = () => {
       mapperReady = false;
       mapperError = Error('Typst source mapper compilation failed; fix the errors and save before jumping.');
       pending?.fail(mapperError);
     };
     const starting = (async () => {
-      controlPort = null; dataPort = null; errorLog = ''; logBuffer = '';
+      controlPort = null; dataPort = null; logBuffer = '';
       instance = child = spawn('nice', ['-n', '19', tinymist,
         '--log-filter', 'tinymist_preview::actor::render=debug,tinymist=info',
         'preview', '--no-open', '--root', root, '--data-plane-host', '127.0.0.1:0',
@@ -465,7 +504,6 @@ async function watch(config) {
       instance.stderr.on('data', chunk => {
         if (child !== instance) return;
         const text = chunk.toString();
-        errorLog = (errorLog + text).slice(-12000);
         logBuffer += text;
         let newline;
         while ((newline = logBuffer.indexOf('\n')) !== -1) {
@@ -481,19 +519,17 @@ async function watch(config) {
         }
       });
       instance.on('error', error => {
-        errorLog += error.message;
+        console.error(`Source mapper process error: ${error.message}`);
         if (child === instance) stopMapper();
       });
       instance.on('exit', () => {
         if (child === instance) stopMapper();
       });
-      for (let attempt = 0; attempt < 200 && (!controlPort || !dataPort); attempt++) {
-        if (child !== instance) throw Error('Source lookup was superseded by a PDF update');
-        if (mapperError) throw mapperError;
+      while (!controlPort || !dataPort) {
+        checkStartup();
         await pause(50);
       }
-      if (mapperError) throw mapperError;
-      if (!controlPort || !dataPort) throw Error('Tinymist source mapper did not start: ' + errorLog);
+      checkStartup();
       const socket = port => new WebSocket(`ws://127.0.0.1:${port}`, { headers: { Origin: `http://127.0.0.1:${port}` } });
       control = socket(controlPort);
       dataSocket = socket(dataPort);
@@ -523,23 +559,26 @@ async function watch(config) {
           if (message.kind === 'CompileError') failCompilation();
         }
       });
-      await Promise.all([control, dataSocket].map(ws => new Promise((resolve, reject) => {
+      await waitForMapper(Promise.all([control, dataSocket].map(ws => new Promise((resolve, reject) => {
         ws.addEventListener('open', resolve, { once: true });
-        ws.addEventListener('error', reject, { once: true });
-      })));
-      for (let attempt = 0; attempt < 200 && !mapperReady; attempt++) {
-        if (child !== instance) throw Error('Source lookup was superseded by a PDF update');
-        if (mapperError) throw mapperError;
+        ws.addEventListener('error', () => reject(Error('Source mapper connection failed')), { once: true });
+        ws.addEventListener('close', () => reject(Error('Source mapper disconnected during preparation')), { once: true });
+      }))), { deadline: startupDeadline, check: checkStartup, timeoutMessage: startupTimeout });
+      while (!mapperReady) {
+        checkStartup();
         await pause(50);
       }
-      if (mapperError) throw mapperError;
-      if (!mapperReady) throw Error('Typst source lookup compilation failed: ' + errorLog);
+      checkStartup();
       await pause(20);
     })();
     mapperPromise = starting;
     try { await starting; }
     catch (error) { if (child === instance) stopMapper(); throw error; }
-    finally { if (mapperPromise === starting) mapperPromise = null; }
+    finally {
+      if (mapperPromise === starting) mapperPromise = null;
+      // No request may still be waiting: warmup owns its own idle cleanup.
+      if (child === instance && mapperReady) scheduleMapperPause();
+    }
   }
 
   function stopMappingWorker() {

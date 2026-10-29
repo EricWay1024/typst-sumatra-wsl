@@ -274,7 +274,11 @@ instead; this extension does not change that global setting. Set
 - **Prewarming is not incremental mapper reuse.** Native recompilation still
   restarts the mapper and invalidates cached source positions. Clicking right
   after a save can require waiting; a lookup interrupted by an update is rejected
-  rather than returning stale line numbers.
+  rather than returning stale line numbers. Cold mapper startup has a separate
+  90-second budget: a cancelled click or a 20-second lookup timeout leaves that
+  shared background compilation running. A slow compile reports “still preparing”,
+  not a syntax error or a dump of Tinymist's startup arguments. The mapper is
+  paused only after preparation has finished.
 - **Window selection is deliberate.** A watcher started inside the intended
   VS Code terminal can inherit `VSCODE_IPC_HOOK_CLI`. Otherwise, the bridge uses a
   unique active, same-user CLI socket. Missing, ambiguous or unresponsive sockets
@@ -384,12 +388,13 @@ Two native-launcher flags inspect the click path without opening the editor:
 From the cloned repository:
 
 ```bash
-node --test test.mjs editor-ipc.test.mjs forward.test.mjs vscode-extension/test.cjs
+node --test test.mjs editor-ipc.test.mjs forward.test.mjs mapper-wait.test.mjs vscode-extension/test.cjs
 mkdir -p scratch
 export TYPST_SUMATRA_SCRATCH="$PWD/scratch"
 node integration-test.mjs
 node forward-integration-test.mjs  # Also requires the synctex command-line tool.
 node syntax-error-integration-test.mjs
+node slow-mapper-integration-test.mjs  # Controlled 22.5-second mapper, real native Typst.
 python3 -B test-windows.py "$TYPST_SUMATRA_SCRATCH/open-in-vscode.exe"
 python3 -B test-forward-windows.py
 ```
@@ -399,8 +404,9 @@ persistent scratch. It covers prewarming, cache hits, authentication, line shift
 rapid saves, negative source replies, editor IPC and fallback. The syntax-error
 regression covers an invalid initial document, prompt failures in both directions,
 queued/burst clicks, last-good-PDF preservation and repair without restarting.
-Forward-search tests
-cover imported sources, supplementary Unicode characters, actual SyncTeX forward
+A controlled slow-mapper fixture checks that cancellation and the interactive
+request deadline neither kill nor pause unfinished preparation, and that the
+next click reuses the same compiler. Forward-search tests cover imported sources, supplementary Unicode characters, actual SyncTeX forward
 queries, cache invalidation after saving, and timeout recovery. Extension tests
 cover Typst-only registration, hover safety, unsaved/stale buffers and rapid clicks;
 a native Windows sentinel checks viewer arguments without opening a PDF.

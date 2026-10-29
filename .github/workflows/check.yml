@@ -18,8 +18,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: node --check typst-sumatra.mjs && node --check integration-test.mjs && node --check forward-integration-test.mjs && node --check syntax-error-integration-test.mjs && node --check vscode-extension/extension.cjs
-      - run: node --test test.mjs editor-ipc.test.mjs forward.test.mjs vscode-extension/test.cjs
+      - run: node --check typst-sumatra.mjs && node --check integration-test.mjs && node --check forward-integration-test.mjs && node --check syntax-error-integration-test.mjs && node --check slow-mapper-integration-test.mjs && node --check test-fixtures/slow-mapper.mjs && node --check vscode-extension/extension.cjs
+      - run: node --test test.mjs editor-ipc.test.mjs forward.test.mjs mapper-wait.test.mjs vscode-extension/test.cjs
       - run: python3 -B vscode-extension/package.py
       - run: bash -n install.sh bin/typst-sumatra windows/build.sh
       - name: Check Python syntax without writing bytecode
